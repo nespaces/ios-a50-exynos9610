@@ -30,6 +30,7 @@ storage  bsd/dev/hakios.virtio_blk.c
 
 gpu      bsd/dev/hakios.adreno.c
 gpu      bsd/dev/hakios.exynos_dpu.c
+gpu      bsd/dev/hakios.ea8076.c
 gpu      bsd/dev/hakios.s6e3ha8.c
 gpu      bsd/dev/hakios.s6e3ha8_gamma.h
 gpu      iokit/Kernel/hakios.backlight.cpp
@@ -45,6 +46,7 @@ camera   bsd/dev/hakios.s2mpb02_torch.c
 camera   bsd/dev/hakios.exynos_camera.c
 
 haptic   bsd/dev/hakios.haptic.c
+haptic   bsd/dev/hakios.gpio_vib.c
 
 audio    bsd/dev/hakios.adsp.c
 audio    bsd/dev/hakios.audio.c
@@ -56,6 +58,7 @@ audio    bsd/dev/hakios.guard.c
 audio    bsd/dev/hakios.exynos_abox.c
 audio    bsd/dev/hakios.max98512.c
 audio    bsd/dev/hakios.cs47l93.c
+audio    bsd/dev/hakios.tfa9872.c
 
 power    bsd/dev/hakios.battery.c
 power    iokit/Kernel/hakios.battery.cpp

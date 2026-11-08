@@ -118,6 +118,7 @@ extern void loader_log_line(const char *line);
 extern int hakios_panel_register(const char *name, int (*set)(int level));     /* hakios.backlight.cpp */
 
 SYSCTL_DECL(_kern_hakios);
+extern int hakios_panel_brightness(int level);     /* hakios.backlight.cpp */
 
 static int say(const char *format, ...) __printflike(1, 2);
 
@@ -538,7 +539,9 @@ panel_sysctl_brightness(__unused struct sysctl_oid *oidp, __unused void *arg1, _
 	if (error != 0 || req->newptr == 0) {
 		return error;
 	}
-	return panel_set(value);
+	/* not the S9's panel (panel=1 not given): whichever panel driver registered (the A50's ea8076) */
+	error = panel_set(value);
+	return error == 0 ? 0 : hakios_panel_brightness(value);
 }
 
 SYSCTL_PROC(_kern_hakios, OID_AUTO, brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY | CTLFLAG_KERN,

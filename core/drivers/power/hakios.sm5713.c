@@ -19,7 +19,7 @@
  * DEVICETYPE2 (0x08) bit 4 OTG. Its interrupt registers (0x01, 0x02) clear when read: never read here.
  * Sources: the A50's device tree (i2c_1, sm5713@49, i2c1_bus), Samsung's 4.14 kernel for it (drivers/mfd/sm5713_core.c,
  * drivers/battery_v2/sm5713_fuelgauge.c, include/linux/mfd/sm5713-private.h, include/linux/muic/sm5713-muic.h), read
- * for these facts, not copied; KIMI-RESULT-POWER-WIFI.md.
+ * for these facts, not copied; the port's analysis notes.
  *
  * In steps, each said before it is made. Boot-arg sm5713_steps=N stops after the first N:
  *   1  map the blocks and read what they are set to          (nothing written)
@@ -29,6 +29,11 @@
  *   5  report every 5 s (the default)
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
+#include <miscfs/devfs/devfs.h>
+#include <sys/conf.h>
+#include <sys/errno.h>
+#include <sys/uio.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -104,6 +109,22 @@ say(const char *format, ...)
 #define POLL_MS                 5000
 
 static vm_offset_t i2c, top;
+static lck_mtx_t *bus_lock;            /* the battery's thread and the flashlight share the bus */
+static volatile bool bus_ready;
+
+/* made once, by whichever of the battery and the flashlight starts first */
+static void
+bus_lock_make(void)
+{
+	static lck_grp_t *group;
+
+	if (bus_lock == NULL) {
+		group = lck_grp_alloc_init("hakios.sm5713", LCK_GRP_ATTR_NULL);
+		bus_lock = lck_mtx_alloc_init(group, LCK_ATTR_NULL);
+	}
+}
+static volatile int32_t last_temp_hundredths;
+static volatile bool last_external = true;     /* (until the first read: no boost asked for) */
 static uint32_t scale = 3;
 static struct {
 	uint64_t transfers, errors;
@@ -167,6 +188,7 @@ bus_read(uint8_t chip, uint8_t reg, uint8_t *r, uint32_t rlen)
 {
 	uint32_t error = 0, con = bus_con();
 
+	lck_mtx_lock(bus_lock);
 	stats.transfers++;
 	for (uint32_t us = 0; us < BYTE_TIMEOUT_US && (rd(i2c, IICSTAT) & STAT_START); us++) {
 		delay(1);
@@ -233,7 +255,216 @@ out:
 		stats.errors++;
 		stats.last_error = error;
 	}
+	lck_mtx_unlock(bus_lock);
 	return error;
+}
+
+/* One register written: the chip's address, the register, the value. 0 or the step that failed (as bus_read). */
+static uint32_t
+bus_write(uint8_t chip, uint8_t reg, uint8_t value)
+{
+	uint32_t error = 0, con = bus_con();
+	const uint8_t bytes[2] = { reg, value };
+
+	lck_mtx_lock(bus_lock);
+	stats.transfers++;
+	for (uint32_t us = 0; us < BYTE_TIMEOUT_US && (rd(i2c, IICSTAT) & STAT_START); us++) {
+		delay(1);
+	}
+	if (rd(i2c, IICSTAT) & STAT_START) {
+		error = 1;
+		goto out;
+	}
+	wr(i2c, IICSTAT, STAT_MASTER_TX | STAT_TXRXEN);
+	wr(i2c, IICDS, (uint32_t)chip << 1);
+	delay(1);
+	wr(i2c, IICCON, con);
+	wr(i2c, IICSTAT, STAT_MASTER_TX | STAT_START | STAT_TXRXEN);
+	if (bus_wait()) {
+		error = 5;
+		goto stop;
+	}
+	if (rd(i2c, IICSTAT) & (STAT_ARBITR | STAT_LASTBIT)) {
+		error = (rd(i2c, IICSTAT) & STAT_ARBITR) ? 6 : 2;
+		goto stop;
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		wr(i2c, IICDS, bytes[i]);
+		delay(1);
+		wr(i2c, IICCON, con);
+		if (bus_wait()) {
+			error = 5;
+			goto stop;
+		}
+		if (rd(i2c, IICSTAT) & STAT_LASTBIT) {
+			error = 3;
+			goto stop;
+		}
+	}
+stop:
+	bus_stop(STAT_MASTER_TX);
+out:
+	if (error != 0) {
+		stats.errors++;
+		stats.last_error = error;
+	}
+	lck_mtx_unlock(bus_lock);
+	return error;
+}
+
+/*
+ * The flashlight (torch=1): the SM5713's flash block (leds-sm5713-fled.c, sm5713_charger_oper.c), at the charger's
+ * address 0x49: FLED1CNTL2 [6:4] the torch current (the device tree's torch-brightness, 4), FLED1CNTL1 [1:0] = 3 (lit
+ * by its pin, "external"), the pin torch-en = gpa1-3 (ALIVE 0x11850000 + 0x40) high. With no cable in, the charger
+ * is put into its flash boost (CNTL2 [3:0] = 8, BSTCNTL1 [3:0] = 4.5 V) while lit, as Samsung's table says, and put
+ * back after. /dev/hakios-torch takes a level of 0 to 1000 (a 32-bit number); any level above 0 is the one current.
+ */
+#define CHG                     0x49
+#define CHG_CNTL2               0x14
+#define CHG_BSTCNTL1            0x23
+#define FLED1CNTL1              0x41
+#define FLED1CNTL2              0x42
+#define TORCH_CURRENT           4
+#define ALIVE_PA                0x11850000UL
+#define GPA1                    0x040
+#define TORCH_PIN               3
+#define TORCH_HOT_C             45
+
+static vm_offset_t alive;
+static uint32_t torch_lit;
+static bool torch_boost;
+static uint8_t saved_cntl2, saved_bst;
+static lck_mtx_t *torch_lock;
+
+static uint32_t
+chg_update(uint8_t reg, uint8_t value, uint8_t mask)
+{
+	uint8_t v = 0;
+	uint32_t e = bus_read(CHG, reg, &v, 1);
+
+	return e != 0 ? e : bus_write(CHG, reg, (uint8_t)((v & ~mask) | (value & mask)));
+}
+
+static bool
+torch_set(uint32_t level)
+{
+	volatile uint32_t *dat = (volatile uint32_t *)(alive + GPA1 + 4);
+	uint32_t e = 0;
+
+	if (level != 0 && torch_lit == 0) {
+		if (!last_external) {
+			uint8_t c = 0, b = 0;
+
+			if (bus_read(CHG, CHG_CNTL2, &c, 1) == 0 && bus_read(CHG, CHG_BSTCNTL1, &b, 1) == 0) {
+				saved_cntl2 = c;
+				saved_bst = b;
+				torch_boost = true;
+				e |= chg_update(CHG_BSTCNTL1, 0x1, 0xf);
+				e |= chg_update(CHG_CNTL2, 0x8, 0xf);
+			}
+		}
+		e |= chg_update(FLED1CNTL2, TORCH_CURRENT << 4, 0x7 << 4);
+		e |= chg_update(FLED1CNTL1, 0x3, 0x3);
+		*dat |= 1u << TORCH_PIN;
+	} else if (level == 0 && torch_lit != 0) {
+		*dat &= ~(1u << TORCH_PIN);
+		e |= chg_update(FLED1CNTL1, 0x0, 0x3);
+		if (torch_boost) {
+			e |= chg_update(CHG_CNTL2, saved_cntl2, 0xf);
+			e |= chg_update(CHG_BSTCNTL1, saved_bst, 0xf);
+			torch_boost = false;
+		}
+	}
+	torch_lit = level;
+	if (e != 0) {
+		say("sm5713: torch %u: an I2C step failed (%u)\n", level, e);
+	}
+	return e == 0;
+}
+
+static int
+torch_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	uint32_t level;
+	int error = uiomove((caddr_t)&level, sizeof(level), uio);
+
+	if (error != 0) {
+		return error;
+	}
+	if (!bus_ready) {
+		return EBUSY;
+	}
+	level = level > 1000 ? 1000 : level;
+	lck_mtx_lock(torch_lock);
+	if (level != 0 && last_temp_hundredths > TORCH_HOT_C * 100) {
+		say("sm5713: torch: the battery is above %d C: the light stays off\n", TORCH_HOT_C);
+		(void)torch_set(0);
+		error = EBUSY;
+	} else if (!torch_set(level)) {
+		error = EIO;
+	}
+	lck_mtx_unlock(torch_lock);
+	return error;
+}
+
+static int
+torch_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	uint32_t level = torch_lit;
+
+	return uiomove((caddr_t)&level, sizeof(level), uio);
+}
+
+static int
+torch_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	return 0;
+}
+
+static const struct cdevsw torch_cdevsw = {
+	.d_open = torch_open, .d_close = torch_open, .d_read = torch_read, .d_write = torch_write,
+	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+void
+hakios_torch_init(void)
+{
+	uint32_t on = 0;
+	int major;
+
+	uint32_t battery = 0;
+
+	if (!PE_parse_boot_argn("torch", &on, sizeof(on)) || on == 0 ||
+	    !PE_parse_boot_argn("sm5713", &battery, sizeof(battery)) || battery == 0) {
+		return;          /* (the bus is the battery driver's: sm5713=1) */
+	}
+	bus_lock_make();
+	alive = ml_io_map(ALIVE_PA, 0x1000);
+	if (alive == 0) {
+		return;
+	}
+	torch_lock = lck_mtx_alloc_init(lck_grp_alloc_init("hakios.torch", LCK_GRP_ATTR_NULL), LCK_ATTR_NULL);
+	{
+		volatile uint32_t *con = (volatile uint32_t *)(alive + GPA1);
+
+		con[1] &= ~(1u << TORCH_PIN);
+		con[0] = (con[0] & ~(0xfu << (4 * TORCH_PIN))) | (1u << (4 * TORCH_PIN));
+	}
+	major = cdevsw_add(-1, &torch_cdevsw);
+	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-torch") == NULL) {
+		say("sm5713: /dev/hakios-torch cannot be made\n");
+		return;
+	}
+	say("sm5713: /dev/hakios-torch: the flashlight for iOS (SM5713 FLED1, gpa1-3)\n");
+}
+
+void
+hakios_torch_quiesce(void)
+{
+	if (alive != 0 && torch_lit != 0 && bus_ready) {
+		(void)torch_set(0);
+	}
 }
 
 /* a 16-bit register of the gauge, little-endian; one retry */
@@ -359,9 +590,12 @@ battery_thread(void *arg, __unused wait_result_t wr_)
 		goto out;
 	}
 
+	bus_ready = true;
 	say("sm5713: step 5: reporting every %u s\n", POLL_MS / 1000);
 	for (unsigned tick = 0;; tick++) {
 		if (battery_read(&b, raw, dt)) {
+			last_temp_hundredths = b.temperature_hundredths;
+			last_external = b.external;
 			hakios_battery_report(&b);
 			if (tick % 60 == 0) {
 				say_state("every 5 minutes", &b, raw, dt);
@@ -387,6 +621,7 @@ hakios_sm5713_init(void)
 	}
 	PE_parse_boot_argn("sm5713_steps", &steps, sizeof(steps));
 	PE_parse_boot_argn("sm5713_scale", &scale, sizeof(scale));
+	bus_lock_make();
 	if (steps == 0 || scale > 15) {
 		return;
 	}

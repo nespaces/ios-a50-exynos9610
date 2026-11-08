@@ -96,10 +96,10 @@ bool
 hakios_hsi2c_map(struct hakios_hsi2c *bus, int (*say)(const char *, ...))
 {
 	bus->regs = ml_io_map(bus->regs_pa, 0x1000);
-	bus->usi = map_word(bus->usi_mode_pa);
+	bus->usi = bus->usi_mode_pa ? map_word(bus->usi_mode_pa) : 0;      /* 0: an I2C of its own, not a USI's */
 	bus->cmu = bus->cmu_pa ? ml_io_map(bus->cmu_pa, bus->cmu_size) : 0;
 	bus->pins = bus->pins_pa ? map_word(bus->pins_pa) : 0;
-	if (!bus->regs || !bus->usi || (bus->cmu_pa && !bus->cmu) || (bus->pins_pa && !bus->pins)) {
+	if (!bus->regs || (bus->usi_mode_pa && !bus->usi) || (bus->cmu_pa && !bus->cmu) || (bus->pins_pa && !bus->pins)) {
 		say("%s: a block of the bus could not be mapped\n", bus->name);
 		return false;
 	}
@@ -107,7 +107,7 @@ hakios_hsi2c_map(struct hakios_hsi2c *bus, int (*say)(const char *, ...))
 		uint32_t div = rd(bus->cmu, bus->div);
 
 		say("%s: USI mode %x (4 is I2C), CMU mux %x, divider %x (400 MHz / %u = %u MHz if the mux takes the 400 MHz "
-		    "branch; assumed %u), gates %x %x %x %x, Q-channel %x\n", bus->name, *(volatile uint32_t *)bus->usi,
+		    "branch; assumed %u), gates %x %x %x %x, Q-channel %x\n", bus->name, bus->usi ? *(volatile uint32_t *)bus->usi : 0,
 		    rd(bus->cmu, bus->mux), div, (div & 0xf) + 1, 400 / ((div & 0xf) + 1), bus->ipclk_mhz,
 		    bus->ngates > 0 ? rd(bus->cmu, bus->gates[0]) : 0, bus->ngates > 1 ? rd(bus->cmu, bus->gates[1]) : 0,
 		    bus->ngates > 2 ? rd(bus->cmu, bus->gates[2]) : 0, bus->ngates > 3 ? rd(bus->cmu, bus->gates[3]) : 0,
@@ -128,7 +128,9 @@ hakios_hsi2c_power(struct hakios_hsi2c *bus)
 	if (bus->cmu && bus->qch) {
 		wr(bus->cmu, bus->qch, rd(bus->cmu, bus->qch) | 3);
 	}
-	*(volatile uint32_t *)bus->usi = USI_MODE_I2C;
+	if (bus->usi) {
+		*(volatile uint32_t *)bus->usi = USI_MODE_I2C;
+	}
 	if (bus->pins) {
 		uint32_t con = *(volatile uint32_t *)bus->pins;
 

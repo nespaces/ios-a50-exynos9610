@@ -414,14 +414,15 @@ static const struct ufshc_soc hc_socs[] = {
 		/*
 		 * The Galaxy A50's (SM-A505FN): its device tree's ufs@0x13520000 (HCI 0x13520000, vendor 0x13521100,
 		 * UniPro 0x13510000, ufs-phy 0x13524000; one lane at HS-G3), PMU 0x11860000 + 0x724 (ufs-exynos.c's
-		 * default cxt_iso), SYSREG_FSYS 0x13410000 + 0x1010 (ufs-dma-coherency). The same controller family as the
+		 * default cxt_iso), SYSREG_FSYS 0x13410000 + 0x1010 (ufs-dma-coherency). PRDT entries of 16 bytes (FMP off on
+		 * the A50: what ufs_native_prd=16 found on the phone) and step 5 by default. The same controller family as the
 		 * 9810's in Samsung's 4.14 kernel for the A50 (drivers/scsi/ufs/ufs-exynos.c: PRDT entry size 12, byte
 		 * granular, DMA mask 32 bits): taken as S-Boot left it.
 		 */
 		.name = "exynos9610", .pa = 0x13520000, .size = 0x200, .vs_pa = 0x13521100, .vs_size = 0x200,
-		.prdt_bytes = true, .prd_entry = 128, .prd_max = 4096, .rsp_offset = 1024, .rsp_length = 1024,
+		.prdt_bytes = true, .prd_entry = 16, .prd_max = 4096, .rsp_offset = 1024, .rsp_length = 1024,
 		.prdt_offset = 2048, .clear_with_ones = true, .dma32 = true, .slot_buffer = 64u << 10,
-		.default_step = 1, .dma_lo = 0x80000000ULL, .dma_hi = 0x100000000ULL,
+		.default_step = 5, .dma_lo = 0x80000000ULL, .dma_hi = 0x100000000ULL,
 		.carve_pa = UFSHC_A50_MEM_PA, .carve_size = UFSHC_A50_MEM_BYTES,
 		.default_slots = 1, .cnr = true,
 		.look = exynos_look, .adopt = exynos_adopt, .nexus = exynos_nexus, .give_back = exynos_give_back,
@@ -3335,7 +3336,14 @@ ufshc_own_probe(void)
 
 	PE_parse_boot_argn("ufs_native", &mode, sizeof(mode));
 	/* ufs_native_soc=NAME: the controller own mode takes: pci (QEMU's, the default), sm7325, exynos9810, exynos9610 */
-	(void)PE_parse_boot_arg_str("ufs_native_soc", name, sizeof(name));
+	if (!PE_parse_boot_arg_str("ufs_native_soc", name, sizeof(name))) {
+		uint32_t acpm_soc = 0;
+
+		/* the A50: acpm_soc=9610 says the SoC (its boot-args are near the command line's limit) */
+		if (PE_parse_boot_argn("acpm_soc", &acpm_soc, sizeof(acpm_soc)) && acpm_soc == 9610) {
+			strlcpy(name, "exynos9610", sizeof(name));
+		}
+	}
 	return hc_own_probe(name, mode, 0);
 }
 

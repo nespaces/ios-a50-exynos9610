@@ -42,3 +42,8 @@ driver S6E3HA8
 	help    the Galaxy S9's panel brightness through DSIM0's command FIFO: the gamma worked out from the panel's MTP as
 	help    Samsung's kernel does (hakios.s6e3ha8_gamma.h) and the AOR, Samsung's tables for each level (panel=1;
 	help    kern.hakios.brightness 0-255, panel_brightness=N at start; panel_gamma=0 the AOR alone)
+
+driver EA8076
+	file    bsd/dev/hakios.ea8076.c
+	help    the Galaxy A50's panel brightness: DCS 51 to the EA8076 through DSIM0's command FIFO, Samsung's table of
+	help    levels (ea8076=1; iOS's brightness through hakios_panel_brightness())

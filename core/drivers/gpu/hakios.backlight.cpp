@@ -28,6 +28,24 @@
 #include <libkern/c++/OSSymbol.h>
 #include <pexpert/pexpert.h>
 #include <string.h>
+#include <stdarg.h>
+
+extern "C" void loader_log_line(const char * line);
+
+/* IOLog does not reach the run's log (loader_log_line, what comes back to the host): both */
+static void bl_say(const char * format, ...) __printflike(1, 2);
+static void
+bl_say(const char * format, ...)
+{
+	char line[300];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	loader_log_line(line);
+	IOLog("%s", line);
+}
 #include <sys/errno.h>
 #include <sys/proc.h>
 
@@ -55,7 +73,7 @@ hakios_panel_register(const char * name, int (*set)(int level))
 	}
 	gPanelName = name;
 	gPanelSet = set;
-	IOLog("hakios: panel brightness: %s registered\n", name);
+	bl_say("hakios: panel brightness: %s registered\n", name);
 	return 0;
 }
 
@@ -152,14 +170,14 @@ AppleARMBacklight::take(const char * who, const char * key, OSObject * value)
 	raw = raw > BACKLIGHT_MAX ? BACKLIGHT_MAX : raw;
 	level = (int) ((raw * 255 + BACKLIGHT_MAX / 2) / BACKLIGHT_MAX);
 	if (gBacklightStep < 2) {
-		IOLog("AppleARMBacklight: (backlight=1: %s's %s %llu would be level %d; not set)\n", who, key, raw, level);
+		bl_say("AppleARMBacklight: (backlight=1: %s's %s %llu would be level %d; not set)\n", who, key, raw, level);
 		return;
 	}
 	error = hakios_panel_brightness(level);
 	if (error == 0) {
 		publishParameters((uint32_t) raw);
 	}
-	IOLog("AppleARMBacklight: %s's %s %llu: level %d %s\n", who, key, raw, level,
+	bl_say("AppleARMBacklight: %s's %s %llu: level %d %s\n", who, key, raw, level,
 	    error == 0 ? "set" : error == ENODEV ? "(no panel driver: not set)" : "NOT SET (the panel driver failed)");
 }
 
@@ -192,9 +210,9 @@ AppleARMBacklight::setProperties(OSObject * properties)
 		if (said < SAID_SETS) {
 			said++;
 			if (number != NULL) {
-				IOLog("AppleARMBacklight: %s sets %s = %llu\n", who, key->getCStringNoCopy(), number->unsigned64BitValue());
+				bl_say("AppleARMBacklight: %s sets %s = %llu\n", who, key->getCStringNoCopy(), number->unsigned64BitValue());
 			} else {
-				IOLog("AppleARMBacklight: %s sets %s (%s)\n", who, key->getCStringNoCopy(),
+				bl_say("AppleARMBacklight: %s sets %s (%s)\n", who, key->getCStringNoCopy(),
 				    value ? value->getMetaClass()->getClassName() : "?");
 			}
 			if (inside != NULL) {
@@ -205,10 +223,10 @@ AppleARMBacklight::setProperties(OSObject * properties)
 					OSNumber * n = OSDynamicCast(OSNumber, inside->getObject(k));
 
 					if (n != NULL) {
-						IOLog("AppleARMBacklight:   %s.%s = %llu\n", key->getCStringNoCopy(), k->getCStringNoCopy(),
+						bl_say("AppleARMBacklight:   %s.%s = %llu\n", key->getCStringNoCopy(), k->getCStringNoCopy(),
 						    n->unsigned64BitValue());
 					} else {
-						IOLog("AppleARMBacklight:   %s.%s (%s)\n", key->getCStringNoCopy(), k->getCStringNoCopy(),
+						bl_say("AppleARMBacklight:   %s.%s (%s)\n", key->getCStringNoCopy(), k->getCStringNoCopy(),
 						    inside->getObject(k) ? inside->getObject(k)->getMetaClass()->getClassName() : "?");
 					}
 				}
@@ -237,7 +255,7 @@ AppleARMBacklight::copyProperty(const char * aKey) const
 
 		said++;
 		proc_selfname(who, sizeof(who));
-		IOLog("AppleARMBacklight: %s asks for %s: not there\n", who, aKey);
+		bl_say("AppleARMBacklight: %s asks for %s: not there\n", who, aKey);
 	}
 	return object;
 }
@@ -252,7 +270,7 @@ AppleARMBacklight::newUserClient(task_t owningTask, void * securityID, UInt32 ty
 	if (said < 8) {
 		said++;
 		proc_selfname(who, sizeof(who));
-		IOLog("AppleARMBacklight: %s opens it (type %u): no user client, refused\n", who, (unsigned) type);
+		bl_say("AppleARMBacklight: %s opens it (type %u): no user client, refused\n", who, (unsigned) type);
 	}
 	return IOService::newUserClient(owningTask, securityID, type, properties, handler);
 }
@@ -272,7 +290,7 @@ hakios_backlight_publish(IOService * display)
 	backlight = OSTypeAlloc(AppleARMBacklight);
 	if (backlight == NULL || !backlight->init()) {
 		OSSafeReleaseNULL(backlight);
-		IOLog("AppleARMBacklight: not made\n");
+		bl_say("AppleARMBacklight: not made\n");
 		return;
 	}
 	/* (until something is set, the panel's level if it was set at start, else the top of the range) */
@@ -289,7 +307,7 @@ hakios_backlight_publish(IOService * display)
 		return;
 	}
 	backlight->registerService();
-	IOLog("AppleARMBacklight: published (backlight=%u: %s); panel driver: %s\n", gBacklightStep,
+	bl_say("AppleARMBacklight: published (backlight=%u: %s); panel driver: %s\n", gBacklightStep,
 	    gBacklightStep >= 2 ? "brightness taken" : "keys only said", gPanelName != NULL ? gPanelName : "none (yet)");
 	backlight->release();           /* (the registry holds it) */
 }

@@ -706,6 +706,8 @@ brightness_fixes(void)
 	method_setImplementation(method, (IMP)wait_for_als_arrival);
 }
 
+#include "brightness_bridge.inc"
+
 /* ---- backboardd: the touch screen and the buttons ---------------------------------------------- */
 
 /* IOKit's HID event system, the part that has no public header on Darwin (prototypes checked against 20F66) */
@@ -1748,6 +1750,7 @@ hakios_init(void)
 		 */
 		input_start();
 		sensors_start();
+		brightness_start();
 	} else if (strncmp(name, "containermanagerd", 17) == 0) {
 		container_manager_fixes();
 	}

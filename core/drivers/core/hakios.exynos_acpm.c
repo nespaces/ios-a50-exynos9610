@@ -56,6 +56,7 @@
 #include "hakios.exynos9610_fvp.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern int cpu_number(void);
 extern void delay(int usec);
 
 /*
@@ -769,6 +770,149 @@ hakios_acpm_fvp9610(uint32_t got[3], int got_e[3], const char *const names[3])
 		}
 	}
 }
+/*
+ * cpu9610=N (the Galaxy A50): the CPU clusters' rates set by this kernel, as hakios.mali.c sets the GPU's -- ACPM's DVFS
+ * plugin, without Linux's set-up, answers a SET and changes nothing. The rail first, through ACPM's PMIC channel (S2MPU09
+ * BUCK2 vdd_cpucl1 OUT 0x1B, BUCK3 vdd_cpucl0 OUT 0x1D: 300 mV + 6.25 mV a step), then the PLL in the cluster's CMU
+ * (cal-if/exynos9610: CMU_CPUCL1 0x10800000 PLL_CON0 +0x120, CMU_CPUCL0 0x10900000 PLL_CON0 +0x140; S [2:0], P [13:8],
+ * M [25:16], MUX_SEL bit 4, MUX_BUSY 7, STABLE 29, ENABLE 31): the cluster on the 26 MHz oscillator (MUX_SEL cleared)
+ * while the PLL relocks, then back. The rates and their dividers are Samsung's own rows (cmucal-node.c pll_cpucl*_rate_table,
+ * cmucal-vclk*.c vdd_cpucl1: DIV_CLK_CLUSTER1_ACLK +0x1800 = 1 from 1499 MHz up); the voltages the phone's fvmap plus a step.
+ *   1  read only: both clusters' PLL, dividers and rails said
+ *   2  set: A73s cl1_mhz= (1898; or 1499), A53s cl0_mhz= (1449; or 1049, S-Boot's), each only from a row below
+ */
+static const struct cpu_rate { uint32_t mhz, m, p, s, aclk_div, uv; } cl1_rates[] = {
+	{ 1898, 292, 4, 0, 1, 1000000 },        /* fvmap 1898000 kHz: 987500 uV */
+	{ 1499, 346, 3, 1, 1, 843750 },         /* fvmap 1508000: 831250 */
+}, cl0_rates[] = {
+	{ 1449, 223, 4, 0, 0xff, 950000 },      /* fvmap 1456000: 937500 (the A53s' ACLK divider left as found) */
+	{ 1049, 323, 4, 1, 0xff, 806250 },      /* fvmap 1053000: 793750 */
+};
+#define CPU_MUX_SEL     (1u << 4)
+#define CPU_MUX_BUSY    (1u << 7)
+#define CPU_PLL_STABLE  (1u << 29)
+#define CPU_PLL_ENABLE  (1u << 31)
+#define CPU_PLL_PMS     ((0x3ffu << 16) | (0x3fu << 8) | 7u)
+
+static bool
+cpu_wait(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, uint32_t us)
+{
+	uint64_t deadline = deadline_us(us);
+
+	while ((rd(base, off) & mask) != want) {
+		if (mach_absolute_time() >= deadline) {
+			return (rd(base, off) & mask) == want;
+		}
+	}
+	return true;
+}
+
+static void
+cpu9610_cluster(const char *name, uint64_t cmu_pa, uint32_t con0_off, uint32_t rail, const struct cpu_rate *r, bool set)
+{
+	vm_offset_t cmu = ml_io_map(cmu_pa, 0x2000);
+	uint32_t con0, aclk, cpu, lock;
+	uint8_t out = 0;
+	int e;
+
+	if (cmu == 0) {
+		dvfs_say("acpm: cpu: %s: CMU not mapped\n", name);
+		return;
+	}
+	con0 = rd(cmu, con0_off);
+	aclk = rd(cmu, 0x1800);
+	cpu = rd(cmu, 0x1810);
+	lock = rd(cmu, 0x0000);
+	e = hakios_acpm_pmic_read(HAKIOS_ACPM_PMIC_PMIC, rail, &out);
+	dvfs_say("acpm: cpu: %s: PLL_CON0 %#x (M %u P %u S %u: %u MHz; %s, %s, the cluster on the %s), LOCKTIME %u, "
+	    "DIV ACLK %#x CPU %#x; rail %#x (%d) = %u uV\n", name, con0, con0 >> 16 & 0x3ff, con0 >> 8 & 0x3f, con0 & 7,
+	    (con0 >> 8 & 0x3f) ? 26 * (con0 >> 16 & 0x3ff) / (con0 >> 8 & 0x3f) >> (con0 & 7) : 0,
+	    (con0 & CPU_PLL_ENABLE) ? "enabled" : "OFF", (con0 & CPU_PLL_STABLE) ? "stable" : "NOT stable",
+	    (con0 & CPU_MUX_SEL) ? "PLL" : "oscillator", lock, aclk, cpu, out, e, 300000 + 6250 * (uint32_t)out);
+	if (!set || r == NULL) {
+		return;
+	}
+	if (!(con0 & CPU_PLL_ENABLE) || !(con0 & CPU_MUX_SEL) || e != 0) {
+		dvfs_say("acpm: cpu: %s: not as expected (PLL off, the cluster not on it, or the rail unread): left alone\n", name);
+		return;
+	}
+	{
+		uint8_t want = (uint8_t)((r->uv - 300000 + 6249) / 6250), back = 0;
+		uint32_t v;
+		const char *failed = NULL;
+
+		if (want > out) {
+			e = hakios_acpm_pmic_write(HAKIOS_ACPM_PMIC_PMIC, rail, want);
+			(void)hakios_acpm_pmic_read(HAKIOS_ACPM_PMIC_PMIC, rail, &back);
+			dvfs_say("acpm: cpu: %s: rail %#x -> %#x (%d), reads %#x = %u uV\n", name, out, want, e, back,
+			    300000 + 6250 * (uint32_t)back);
+			if (e != 0 || back != want) {
+				dvfs_say("acpm: cpu: %s: the rail not raised: the rate left alone\n", name);
+				return;
+			}
+			delay(300);
+		}
+		if (r->aclk_div != 0xff && (aclk & 7) < r->aclk_div) {
+			wr(cmu, 0x1800, (aclk & ~7u) | r->aclk_div);       /* the cluster's bus slower first, before its clock rises */
+			(void)cpu_wait(cmu, 0x1800, 1u << 16, 0, 1000);
+		}
+		wr(cmu, con0_off, rd(cmu, con0_off) & ~CPU_MUX_SEL);
+		if (!cpu_wait(cmu, con0_off, CPU_MUX_BUSY, 0, 1000)) {
+			failed = "the mux did not move to the oscillator";
+		} else {
+			v = rd(cmu, con0_off) & ~(CPU_PLL_ENABLE | CPU_PLL_PMS);
+			wr(cmu, con0_off, v);
+			v |= r->m << 16 | r->p << 8 | r->s;
+			wr(cmu, con0_off, v);
+			wr(cmu, con0_off, v | CPU_PLL_ENABLE);
+			if (!cpu_wait(cmu, con0_off, CPU_PLL_STABLE, CPU_PLL_STABLE, 5000)) {
+				failed = "the PLL did not lock";
+			}
+		}
+		if (failed != NULL) {
+			/* back as found: the old M/P/S, locked, the cluster on it */
+			wr(cmu, con0_off, (con0 & ~(CPU_PLL_ENABLE | CPU_MUX_SEL)));
+			wr(cmu, con0_off, (con0 & ~CPU_MUX_SEL));
+			(void)cpu_wait(cmu, con0_off, CPU_PLL_STABLE, CPU_PLL_STABLE, 5000);
+		}
+		wr(cmu, con0_off, rd(cmu, con0_off) | CPU_MUX_SEL);
+		(void)cpu_wait(cmu, con0_off, CPU_MUX_BUSY, 0, 1000);
+		if (failed != NULL) {
+			wr(cmu, 0x1800, aclk);
+		}
+		con0 = rd(cmu, con0_off);
+		dvfs_say("acpm: cpu: %s: %s: PLL_CON0 %#x (M %u P %u S %u: %u MHz, %s, on the %s), DIV ACLK %#x\n", name,
+		    failed ? failed : "switched", con0, con0 >> 16 & 0x3ff, con0 >> 8 & 0x3f, con0 & 7,
+		    (con0 >> 8 & 0x3f) ? 26 * (con0 >> 16 & 0x3ff) / (con0 >> 8 & 0x3f) >> (con0 & 7) : 0,
+		    (con0 & CPU_PLL_STABLE) ? "stable" : "NOT stable", (con0 & CPU_MUX_SEL) ? "PLL" : "oscillator",
+		    rd(cmu, 0x1800));
+	}
+}
+
+static void
+cpu9610(uint32_t level)
+{
+	uint32_t cl1 = 1898, cl0 = 1449;
+	const struct cpu_rate *r1 = NULL, *r0 = NULL;
+
+	PE_parse_boot_argn("cl1_mhz", &cl1, sizeof(cl1));
+	PE_parse_boot_argn("cl0_mhz", &cl0, sizeof(cl0));
+	for (unsigned i = 0; i < sizeof(cl1_rates) / sizeof(cl1_rates[0]); i++) {
+		r1 = cl1_rates[i].mhz == cl1 ? &cl1_rates[i] : r1;
+	}
+	for (unsigned i = 0; i < sizeof(cl0_rates) / sizeof(cl0_rates[0]); i++) {
+		r0 = cl0_rates[i].mhz == cl0 ? &cl0_rates[i] : r0;
+	}
+	if (!hakios_acpm_init(dvfs_say)) {
+		dvfs_say("acpm: cpu: no ACPM (the rails): nothing done\n");
+		return;
+	}
+	dvfs_say("acpm: cpu: cpu9610=%u on cpu %d: A73s %u MHz%s, A53s %u MHz%s\n", level, cpu_number(), cl1,
+	    r1 ? "" : " (no such row: left)", cl0, r0 ? "" : " (no such row: left)");
+	cpu9610_cluster("cpucl1 (the A73s)", 0x10800000ULL, 0x120, 0x1B, r1, level >= 2);
+	cpu9610_cluster("cpucl0 (the A53s)", 0x10900000ULL, 0x140, 0x1D, r0, level >= 2);
+}
+
 void
 hakios_exynos_dvfs_start(void)
 {
@@ -783,23 +927,28 @@ hakios_exynos_dvfs_start(void)
 		PE_parse_boot_argn("acpm_soc", &soc, sizeof(soc));
 		PE_parse_boot_argn("acpm9610", &acpm_passive, sizeof(acpm_passive));
 		if (soc == 9610) {
+			uint32_t cpu = 0;
+
 			acpm_mbox_pa = 0x11900000UL;
 			acpm_sram_size = 0x15000;
 			acpm_initdata = 0x6F00;
 			acpm_fvmap = 0x6000;
+			if (PE_parse_boot_argn("cpu9610", &cpu, sizeof(cpu)) && cpu != 0 && acpm_passive != 1) {
+				cpu9610(cpu);
+			}
 		}
 		if (soc == 9610 && acpm_passive >= 2) {
 			/*
 			 * acpm9610=2: IPC GET of each domain's rate and the PMIC's rails read (BUCK2 vdd_cpucl1 0x1A/0x1B, BUCK3
 			 * vdd_cpucl0 0x1C/0x1D, BUCK5 vdd_g3d 0x20/0x21: S2MPU09, s2mpu09-regulator.h); acpm9610=3: then a rate
 			 * set through ACPM for each domain whose GET answered, only to a level of its own fvmap (acpm_cl0=,
-			 * acpm_cl1=, acpm_g3d= kHz; defaults 1534000, 1768000, 572000), and GET again. The APM sets the voltage
+			 * acpm_cl1=, acpm_g3d= kHz; defaults 1534000, 2080000, 572000), and GET again. The APM sets the voltage
 			 * with the rate. the port's analysis notes, steps B and C.
 			 */
 			static const struct { uint8_t ctrl, out; const char *name; } rails[] = {
 				{ 0x1A, 0x1B, "BUCK2 vdd_cpucl1" }, { 0x1C, 0x1D, "BUCK3 vdd_cpucl0" }, { 0x20, 0x21, "BUCK5 vdd_g3d" },
 			};
-			uint32_t want[3] = { 1534000, 1768000, 572000 }, got[3] = { 0 };
+			uint32_t want[3] = { 1534000, 2080000, 572000 }, got[3] = { 0 };
 			int got_e[3];
 			uint32_t active = acpm_passive;
 
@@ -899,6 +1048,7 @@ hakios_exynos_dvfs_start(void)
 
 				dvfs_say("acpm: 9610: after: %s OUT %#x (%d) = %u uV\n", rails[r].name, out, e, 300000 + 6250 * (uint32_t)out);
 			}
+			cpu9610(1);         /* the clusters' PLLs as they read now: did the APM change them? */
 			return;
 		}
 		if (soc == 9610 && acpm_passive) {

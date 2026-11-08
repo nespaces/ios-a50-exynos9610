@@ -59,3 +59,10 @@ driver CS47L93
 	help    the Galaxy S9's audio codec, a Cirrus CS47L93 on PERIC0's SPI (cs47l93=N of 6 steps: 1 a look, 2 powered and
 	help    its ID read, 3 the jack, 4 its clocks, 5 the main microphone, 6 AIF1 to ABOX's UAIF0, recorded by "abox rec");
 	help    the headphones (OUT2, the jack watched) only with cs47l93_hp=1
+
+driver TFA9872
+	file    bsd/dev/hakios.tfa9872.c
+	requires EXYNOS_HSI2C
+	help    the Galaxy A50's speaker amplifier, an NXP TFA9872 on I2C_CMGP00, fed by ABOX's UAIF2 (tfa9872=N: 1 a look,
+	help    2 set up from the phone's Tfa9872.cnt and powered down, 3 turned on and off by UAIF2's start and stop;
+	help    with abox=8 abox_soc=9610)

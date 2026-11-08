@@ -12,15 +12,18 @@ This is an independent hobby integration. It is not affiliated with or endorsed 
 | Area | State |
 |---|---|
 | Boot | S-Boot → `devices/a50/soc/shim` (EL1, no UEFI) → xnuloader → XNU 22.5 → launchd → SpringBoard |
-| Display | S-Boot's framebuffer (1080×2340, DECON_F), TE-driven; iOS's 1125×2436 scaled on 6 cores, ~60 fps in the UI |
+| Display | S-Boot's framebuffer (1080×2340, DECON_F), TE-driven, triple-buffered by the DPU (no tearing); iOS's 1125×2436 scaled on 6 cores, ~60 fps in the UI |
 | Storage | own UFS driver for the 9610 (`ufs_native=4`): iOS system on SYSTEM, `/private/var` (HFS+) on USERDATA, kept between boots |
 | CPU | 7 of 8 cores (S-Boot parks one), PSCI via a low trampoline (EL3 keeps 32 bits of the entry) |
 | GPU | Mali-G72 MP3 with Mesa/Panfrost (accelerated CoreAnimation), 683 MHz via ACPM-driven rail |
 | Touch | Melfas MSS100 (`drivers/input/hakios.melfas_mss100.c`) |
 | Keys | power / volume (`exynos_keys=2`) |
 | Battery | SM5713 fuel gauge + MUIC, read only (`drivers/power/hakios.sm5713.c`) |
-| ACPM | PMIC channel works; the `fvp` plugin is loaded and attached by the kernel; CPU DVFS not yet |
-| Not yet | sound (ABOX + TFA9872), Wi-Fi (Samsung SCSC S620, a driver of its own), camera, modem, CPU frequency scaling |
+| ACPM | PMIC channel works; the `fvp` plugin is loaded and attached by the kernel; CPU clusters set to 2080/1534 MHz |
+| Sound | speaker: ABOX (CPU off) → UAIF2 → NXP TFA9872 (`abox=8 tfa9872=3`), volume from iOS |
+| Brightness | EA8076 panel via DSIM0 DCS 51, from Settings and Control Center |
+| Vibration | the motor via its GPIO-switched LDO (`vib=1`) |
+| Not yet | Wi-Fi (Samsung SCSC S620, a driver of its own), camera (and so the flashlight), ringtones (AAC), modem; UI stalls when going home |
 
 ## Building
 

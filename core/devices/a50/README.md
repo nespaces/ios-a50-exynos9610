@@ -34,12 +34,17 @@ README for the table.
 
 ## The boot-arguments that work
 
-    -q debug=0x8 rd=md0 cpus=7 small_cores_after=0 psci_low=0xDA400000 bootcpu=0 esslog=2
-    exynos_keys=2 melfas=1 sm5713=1 acpm_soc=9610
-    mali=9 mali_soc=9610 mali_mhz=683 mali_uv=750000
-    ufs_native=4 ufs_native_soc=exynos9610 ufs_native_step=5 ufs_native_prd=16 ufs_native_ref_fnv=<YOURS>
-    ufs_native_ro=0 ufs_native_write=userdata ufs_native_data=1 var_hfs=ufs_userdata_data var_save_ms=0
-    system_apfs=ufs_system fb_threads=6 fb_rt=1 fb_ca_hz=120
+    -q rd=md0 cpus=7 small_cores_after=0 psci_low=0xDA400000 bootcpu=0
+    exynos_keys=2 melfas=1 sm5713=1 acpm_soc=9610 acpm9610=7
+    mali=9 mali_mhz=683 mali_uv=750000
+    ufs_native=4 ufs_native_slots=4 ufs_native_ref_fnv=<YOURS>
+    ufs_native_write=userdata ufs_native_data=1 var_hfs=ufs_userdata_data var_save_ms=0
+    system_apfs=ufs_system fb_threads=6 fb_rt=1 fb_ca_hz=120 fb_flip=1
+    vib=1 abox=8 tfa9872=3 ea8076=1 backlight=2 brightness_bridge=1
+
+XNU keeps only about 607 characters of the command line (the loader's own arguments included); whatever is past
+that is dropped without a word. So the A50's defaults live in the drivers: `acpm_soc=9610` also tells the Mali, UFS
+and ABOX drivers the SoC, and the UFS controller's PRDT entry size and step are the 9610's by default.
 
 - `ufs_native_ref_fnv`: the driver checks its first reads against the host's: FNV-1a (64 bits) of the first 8192
   bytes of LUN 0, which holds the partition table and so differs from phone to phone. In TWRP:
@@ -52,8 +57,16 @@ print(hex(h))" lun0.bin`.
 - `mali_mhz=683 mali_uv=750000`: the phone's own fvmap gives 737.5 mV for 683 MHz; 764 MHz showed artefacts.
 - `fb_threads=6 fb_rt=1 fb_ca_hz=120`: the scaling shared over six cores, the window server's render thread
   real-time, CoreAnimation told 120 Hz -- about 60 frames a second in the UI (10 without).
-- `acpm9610=6` (optional): loads and attaches Samsung's `fvp` plugin (tools/a50-fvp.py) before anything asks the
-  DVFS channel; asking it first leaves the APM firmware dead until the next boot.
+- `acpm9610=7`: loads and attaches Samsung's `fvp` plugin (tools/a50-fvp.py) before anything asks the DVFS channel
+  (asking it first leaves the APM firmware dead until the next boot), then sets the CPU clusters (2080/1534 MHz).
+- `fb_flip=1`: the DPU's IDMA flips between three buffers: no tearing.
+- `vib=1`: the vibration motor (an LDO switched by a GPIO, drivers/haptic/hakios.gpio_vib.c).
+- `abox=8 tfa9872=3`: the speaker: ABOX with its CPU off, UAIF2, the NXP TFA9872 amplifier on I2C_CMGP00, set up as
+  the phone's Tfa9872.cnt says (gain as Samsung's, never more; no SpeakerBoost: hakios.guard.c limits the samples).
+- `ea8076=1 backlight=2 brightness_bridge=1`: the panel's brightness (DCS 51 through DSIM0) from Settings and
+  Control Center.
+- `hang_watch=N` (diagnostic): every second the user stack of SpringBoard's, backboardd's and mediaserverd's main
+  threads into the log.
 
 ## Installing (erases Android)
 

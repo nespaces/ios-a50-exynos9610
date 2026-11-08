@@ -209,7 +209,8 @@ static inline void wr(vm_offset_t base, uint32_t offset, uint32_t value) { *(vol
  */
 static bool soc9610;
 static vm_offset_t idma9610;
-static const uint64_t dma9610_pa[4] = { 0x14891000ULL, 0x14892000ULL, 0x14896000ULL, 0x14895000ULL };
+/* each dpp node's FIRST reg is its IDMA (the second its DPP: dpu20 dpp_drv.c), in the nodes' order */
+static const uint64_t dma9610_pa[4] = { 0x14881000ULL, 0x14882000ULL, 0x14883000ULL, 0x14884000ULL };
 static inline vm_offset_t idma(unsigned type) { return soc9610 ? idma9610 : dma + 0x1000 * (type + 1); }
 static inline vm_offset_t dppc(unsigned type) { return dpp + 0x1000 * (type + 1); }
 
@@ -287,8 +288,7 @@ probe9610(uint64_t fb_phys, uint32_t width, uint32_t height)
 		img = rd(m, IDMA_IMG_SIZE);
 		say("exynos_dpu: 9610: DMA%u at %#llx: enable %x base %08x img %x src %x\n", k, dma9610_pa[k],
 		    rd(m, IDMA_ENABLE), base, img, rd(m, IDMA_SRC_SIZE));
-		/* (on the A50 IN_BASE_ADDR_Y and SRC_SIZE read 0 though the block scans S-Boot's buffer: matched by its size) */
-		if (found < 0 && (base == (uint32_t)fb_phys || base == 0) && img == (height << 16 | width)) {
+		if (found < 0 && base == (uint32_t)fb_phys && img == (height << 16 | width)) {
 			found = (int)k;
 			idma9610 = m;
 		}

@@ -3282,7 +3282,14 @@ ufs_nufs_start(void)
 	bool window = false;
 
 	ufshc_log_direct(true);
-	(void)PE_parse_boot_arg_str("ufs_native_soc", soc, sizeof(soc));
+	if (!PE_parse_boot_arg_str("ufs_native_soc", soc, sizeof(soc))) {
+		uint32_t acpm_soc = 0;
+
+		/* the A50: acpm_soc=9610 says the SoC (its boot-args are near the command line's limit) */
+		if (PE_parse_boot_argn("acpm_soc", &acpm_soc, sizeof(acpm_soc)) && acpm_soc == 9610) {
+			strlcpy(soc, "exynos9610", sizeof(soc));
+		}
+	}
 	PE_parse_boot_argn("ufs_native_ro", &ro, sizeof(ro));
 	PE_parse_boot_argn("ufs_native_verify", &ufs_nufs_verify, sizeof(ufs_nufs_verify));
 	PE_parse_boot_argn("ufs_native_soak", &ufs_nufs_soak, sizeof(ufs_nufs_soak));

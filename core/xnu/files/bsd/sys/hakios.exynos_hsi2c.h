@@ -13,7 +13,8 @@
 struct hakios_hsi2c {
 	const char *name;               /* for the log */
 	uint64_t regs_pa;               /* the HSI2C */
-	uint64_t usi_mode_pa;           /* the USI's mode word in its system register block: 4 makes it an I2C */
+	uint64_t usi_mode_pa;           /* the USI's mode word in its system register block: 4 makes it an I2C; 0: none
+	                                 * (an I2C block of its own, as the 9610's I2C_CMGP00) */
 	uint64_t cmu_pa;                /* the CMU block its clocks are in, and in it: */
 	uint32_t cmu_size;
 	uint32_t gates[4], ngates;      /*   gates forced on (bit 20 manual, bit 21 on) */

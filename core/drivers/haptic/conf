@@ -6,3 +6,8 @@ driver HAPTIC
 	file    bsd/dev/hakios.haptic.c
 	help    the vibration motor: an Awinic AW86927 driving a linear resonant actuator (haptic=N), its waveforms
 	help    from fw-haptic/
+
+driver GPIO_VIB
+	file    bsd/dev/hakios.gpio_vib.c
+	help    the Galaxy A50's vibration motor: an eccentric-mass motor whose supply a pin switches (sec_vib, gpa2-1),
+	help    run while Darwin's Actuator plays (vib=1); instead of HAPTIC, never with it

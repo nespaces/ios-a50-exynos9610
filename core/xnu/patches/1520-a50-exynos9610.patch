@@ -9,6 +9,18 @@ diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobil
  /*
   * Boot-arg fb_tcoal=1: the kernel's timer coalescing left on. By default this driver turns it off when it starts
   * (mach_timer_coalescing_enabled, the switch of sysctl kern.timer_coalescing_enabled). CoreAnimation draws a frame when a
+@@ -932,9 +933,9 @@
+ 		if (said < 64) {
+ 			said++;
+ 			if (number != NULL) {
+-				IOLog("IOMobileFramebuffer: %s sets %s = %llu\n", who, key->getCStringNoCopy(), number->unsigned64BitValue());
++				scanSay("IOMobileFramebuffer: %s sets %s = %llu\n", who, key->getCStringNoCopy(), number->unsigned64BitValue());
+ 			} else {
+-				IOLog("IOMobileFramebuffer: %s sets %s (%s)\n", who, key->getCStringNoCopy(),
++				scanSay("IOMobileFramebuffer: %s sets %s (%s)\n", who, key->getCStringNoCopy(),
+ 				    dict->getObject(key) ? dict->getObject(key)->getMetaClass()->getClassName() : "?");
+ 			}
+ 		}
 @@ -1244,6 +1245,12 @@
  	int32_t px0 = job->px0, py0 = job->py0, px1 = job->px1, py1 = job->py1, cx0 = job->cx0, cx1 = job->cx1;
  	bool filter = job->filter;
@@ -110,6 +122,24 @@ diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobil
  	if (want == 0 && !gFpsLog) {
  		return;
  	}
+@@ -3038,7 +3105,7 @@
+ 
+ 		gFBCalls[selector]++;
+ 		proc_selfname(procname, sizeof(procname));
+-		IOLog("MiniIOMobileFramebuffer: %s[%d] selector %u (scalars %u in [0x%llx 0x%llx 0x%llx 0x%llx], %u out; "
++		scanSay("MiniIOMobileFramebuffer: %s[%d] selector %u (scalars %u in [0x%llx 0x%llx 0x%llx 0x%llx], %u out; "
+ 		    "structure %u in, %u out)\n", procname, proc_selfpid(), selector, args->scalarInputCount,
+ 		    args->scalarInputCount > 0 ? in[0] : 0, args->scalarInputCount > 1 ? in[1] : 0,
+ 		    args->scalarInputCount > 2 ? in[2] : 0, args->scalarInputCount > 3 ? in[3] : 0, args->scalarOutputCount,
+@@ -3171,7 +3238,7 @@
+ 
+ 	if (selector < 128 && !(gFBLogged[selector / 64] & (1ULL << (selector % 64)))) {
+ 		gFBLogged[selector / 64] |= 1ULL << (selector % 64);
+-		IOLog("MiniIOMobileFramebuffer: selector %u not implemented (scalars %u in [0x%llx 0x%llx 0x%llx], %u out; "
++		scanSay("MiniIOMobileFramebuffer: selector %u not implemented (scalars %u in [0x%llx 0x%llx 0x%llx], %u out; "
+ 		    "structure %u in, %u out)\n", selector, args->scalarInputCount, args->scalarInputCount > 0 ? in[0] : 0,
+ 		    args->scalarInputCount > 1 ? in[1] : 0, args->scalarInputCount > 2 ? in[2] : 0, args->scalarOutputCount,
+ 		    args->structureInputSize, args->structureOutputSize);
 diff --git a/osfmk/arm64/loader_return.c b/osfmk/arm64/loader_return.c
 --- a/osfmk/arm64/loader_return.c
 +++ b/osfmk/arm64/loader_return.c
@@ -195,6 +225,123 @@ diff --git a/osfmk/arm64/loader_return.c b/osfmk/arm64/loader_return.c
  		return;
  	}
  	hdr = (volatile uint8_t *)ml_io_map(ESSLOG_HDR_PA, 0x1000);
+@@ -960,3 +1019,116 @@
+ 	__builtin_arm_wsr64("DAIF", daif);
+ 	printf("esslog: the log goes to exynos-snapshot's log_kernel too (%u bytes so far): /proc/last_kmsg in TWRP\n", len);
+ }
++
++/*
++ * Boot-arg hang_watch=N: every second, the user stack of the main thread of SpringBoard, backboardd and mediaserverd
++ * (N frames, at most 16), into the run's log when it differs from the last one said (and every 10 s regardless), with
++ * the thread's state, its wait event and the task's shared cache slide: what each waits on when the screen stalls.
++ * The addresses are user space's (the dyld shared cache, slid): symbolicated on the host.
++ */
++#include <kern/backtrace.h>
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <vm/vm_shared_region.h>
++
++extern char *proc_name_address(struct proc *p);
++
++extern queue_head_t tasks;
++extern kern_return_t thread_suspend(thread_t thread);
++extern kern_return_t thread_resume(thread_t thread);
++extern lck_mtx_t tasks_threads_lock;
++
++static uint32_t hang_frames;
++static const char *const hang_names[] = { "SpringBoard", "backboardd", "mediaserverd" };
++static uintptr_t hang_last[3][16];
++static unsigned hang_last_n[3];
++
++static void
++hang_sample(unsigned which, uint64_t second)
++{
++	task_t task, found = TASK_NULL;
++	thread_t main = THREAD_NULL;
++	char line[400];
++	uintptr_t bt[16];
++	unsigned n, len;
++	int pid = 0;
++
++	lck_mtx_lock(&tasks_threads_lock);
++	queue_iterate(&tasks, task, task_t, tasks) {
++		struct proc *p = (struct proc *)get_bsdtask_info(task);
++
++		if (p != NULL && strncmp(proc_name_address(p), hang_names[which], 16) == 0 && !queue_empty(&task->threads)) {
++			found = task;
++			pid = proc_pid(p);
++			main = (thread_t)queue_first(&task->threads);
++			task_reference(found);
++			thread_reference(main);
++			break;
++		}
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++	if (found == TASK_NULL) {
++		return;
++	}
++	struct backtrace_control ctl = BTCTL_INIT;
++	struct backtrace_user_info info = BTUINFO_INIT;
++	uint32_t slide = 0;
++	vm_shared_region_t sr = vm_shared_region_get(found);
++
++	if (sr != NULL) {
++		slide = sr->sr_slide;
++		vm_shared_region_deallocate(sr);
++	}
++	/* stopped while its stack is read (backtrace_control: "the current thread or one which has been suspended") */
++	if (thread_suspend(main) != KERN_SUCCESS) {
++		thread_deallocate(main);
++		task_deallocate(found);
++		return;
++	}
++	ctl.btc_user_thread = main;
++	n = backtrace_user(bt, hang_frames, &ctl, &info);
++	(void)thread_resume(main);
++	bool same = n == hang_last_n[which] && memcmp(bt, hang_last[which], n * sizeof(bt[0])) == 0;
++
++	if (!same || second % 10 == 0) {
++		len = (unsigned)snprintf(line, sizeof(line), "hang_watch: %llu s %s[%d] main tid %llu state %#x pri %d wait %#llx slide %#x%s:",
++		    second, hang_names[which], pid, main->thread_id, main->state, main->sched_pri,
++		    (uint64_t)VM_KERNEL_UNSLIDE_OR_PERM(main->wait_event), slide, same ? " (same)" : "");
++		for (unsigned i = 0; i < n && len < sizeof(line) - 20; i++) {
++			len += (unsigned)snprintf(line + len, sizeof(line) - len, " %lx", bt[i]);
++		}
++		snprintf(line + len, sizeof(line) - len, "\n");
++		loader_log_line(line);
++		memcpy(hang_last[which], bt, n * sizeof(bt[0]));
++		hang_last_n[which] = n;
++	}
++	thread_deallocate(main);
++	task_deallocate(found);
++}
++
++static void
++hang_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (uint64_t second = 0;; second++) {
++		delay_for_interval(1000, NSEC_PER_MSEC);
++		for (unsigned w = 0; w < 3; w++) {
++			hang_sample(w, second);
++		}
++	}
++}
++
++__startup_func
++static void
++hang_watch_init(void)
++{
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("hang_watch", &hang_frames, sizeof(hang_frames)) || hang_frames == 0) {
++		return;
++	}
++	hang_frames = hang_frames > 16 ? 16 : hang_frames;
++	if (kernel_thread_start(hang_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, hang_watch_init);
 diff --git a/osfmk/arm64/psci_smp.c b/osfmk/arm64/psci_smp.c
 --- a/osfmk/arm64/psci_smp.c
 +++ b/osfmk/arm64/psci_smp.c

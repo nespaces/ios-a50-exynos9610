@@ -2178,7 +2178,9 @@ hakios_mali_init(void)
 	(void)PE_parse_boot_argn("mali_pll", &mali_pll, sizeof(mali_pll));
 	(void)PE_parse_boot_argn("mali_mhz", &mali_mhz, sizeof(mali_mhz));
 	(void)PE_parse_boot_argn("mali_acpm", &mali_acpm, sizeof(mali_acpm));
-	(void)PE_parse_boot_argn("mali_soc", &mali_soc, sizeof(mali_soc));
+	if (!PE_parse_boot_argn("mali_soc", &mali_soc, sizeof(mali_soc))) {
+		(void)PE_parse_boot_argn("acpm_soc", &mali_soc, sizeof(mali_soc));    /* the A50: acpm_soc=9610 says it */
+	}
 	(void)PE_parse_boot_argn("mali_peek", &mali_peek, sizeof(mali_peek));
 	if (mali_soc == 9610) {
 		mali_pmu_phys = 0x11860000UL;

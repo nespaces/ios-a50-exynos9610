@@ -174,6 +174,78 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);       /* osfmk
 extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_line(const char *line);
 
+/*
+ * ---- the Galaxy A50 (Exynos 9610, boot-arg abox_soc=9610) ---------------------------------------------------------------
+ * The same ABOX (one Samsung driver for both SoCs: abox.c, abox_reg_defaults_9610), elsewhere in the map and in another
+ * power domain: DISPAUD, shared with the display, so already on. The speaker is UAIF2's (the machine driver
+ * exynos9610-rt5665.c, "SPEAKER" <- "ABOX UAIF2 Playback"), an NXP TFA9872 on I2C_CMGP00 (hakios.tfa9872.c). Every
+ * value below is the A50 kernel's (cal-if/exynos9610/cmucal-sfr.c, -node.c, -vclklut.c; pmucal_*_exynos9610.h; abox.c's
+ * CONFIG_SOC_EXYNOS9610 block) or its live device tree's (abox@14A50000 with sysreg 0x14810000, sysmmu@14920000,
+ * abox_rmem 0xE9400000 + 0x2800000, pinctrl@14A60000 aud-i2s2-bus). What changes for the S9's steps:
+ *   - no DIV_CLK_AUD_BUSP: the block's APB is DIV_CLK_DISPAUD_BUSP, the display's too, and is never written here
+ *   - SYSREG MISC_CON is not written (abox.c writes it only with the "share vts sram" quirk, which the 9610 has not)
+ *   - the domain is on from the boot (the panel's): no power-on and no DTZPC restore, and never off at the end
+ * The log says "UAIF1" where this driver's text was written for the S9: on the A50 that is UAIF2.
+ */
+static bool soc9610;
+static uint32_t spk_uaif = 1;           /* the speaker's UAIF: 1 on the S9, 2 on the A50 */
+static volatile bool hp_on;             /* iOS's sound goes to UAIF0 (the codec, the headphones), not to UAIF1 */
+
+#undef ABOX_SFR_PA
+#define ABOX_SFR_PA             (abox.pa)
+#undef ABOX_CMU_PA
+#define ABOX_CMU_PA             (cmu.pa)
+#undef ABOX_RMEM_PA
+#define ABOX_RMEM_PA            (soc9610 ? 0xE9400000u : 0xFB200000u)
+#undef ABOX_DTZPC_ARG
+#define ABOX_DTZPC_ARG          (soc9610 ? 0x14810204u : 0x17C10204u)
+#undef PMU_GPIO_MODE_ABOX
+#define PMU_GPIO_MODE_ABOX      (soc9610 ? 0x1308u : 0x1424u)
+#undef PMU_PAD_RETENTION_ABOX
+#define PMU_PAD_RETENTION_ABOX  (soc9610 ? 0x3048u : 0x4170u)
+#undef PMU_ABOX_CPU_CONFIG
+#define PMU_ABOX_CPU_CONFIG     (soc9610 ? 0x2520u : 0x415Cu)
+#undef PMU_ABOX_CPU_STATUS
+#define PMU_ABOX_CPU_STATUS     (soc9610 ? 0x2524u : 0x4160u)
+#undef PMU_ABOX_CPU_OPTION
+#define PMU_ABOX_CPU_OPTION     (soc9610 ? 0x2528u : 0x4164u)
+#undef PMU_ABOX_CPU_ENABLE
+#define PMU_ABOX_CPU_ENABLE     (soc9610 ? 0x00008000u : 0x10000000u)
+#undef PMU_ABOX_CPU_STANDBY
+#define PMU_ABOX_CPU_STANDBY    (soc9610 ? 0x2524u : 0x3804u)
+#undef CMU_PLL_CON0
+#define CMU_PLL_CON0            (soc9610 ? 0x0160u : 0x0120u)
+#undef CMU_PLL_CON3
+#define CMU_PLL_CON3            (soc9610 ? 0x016Cu : 0x018Cu)
+#undef CMU_DIV_BUS
+#define CMU_DIV_BUS             (soc9610 ? 0x1808u : 0x1804u)
+#undef CMU_DIV_PLL
+#define CMU_DIV_PLL             (soc9610 ? 0x180Cu : 0x1820u)   /* (read only) 9610: DIV_CLK_AUD_CPU */
+#undef CMU_DIV_UAIF1
+#define CMU_DIV_UAIF1           (soc9610 ? 0x182Cu : 0x1828u)   /* the speaker UAIF's BCLK divider */
+#undef CMU_MUX_CPU
+#define CMU_MUX_CPU             (soc9610 ? 0x1000u : 0x1000u)   /* (read only) 9610: MUX_CLK_AUD_BUS */
+#undef CMU_MUX_UAIF1
+#define CMU_MUX_UAIF1           (soc9610 ? 0x1018u : 0x1008u)
+#undef CMU_HCHGEN_CLKMUX
+#define CMU_HCHGEN_CLKMUX       (soc9610 ? 0x0840u : 0x0850u)
+#undef CMU_GATE_BCLK_UAIF1
+#define CMU_GATE_BCLK_UAIF1     (soc9610 ? 0x2008u : 0x2020u)
+#undef CMU_GATE_RSTN_UAIF1
+#define CMU_GATE_RSTN_UAIF1     (soc9610 ? 0x2018u : 0x2094u)
+#undef CMU_QCH_ACLK
+#define CMU_QCH_ACLK            (soc9610 ? 0x3014u : 0x3024u)
+#undef CMU_QCH_BCLK1
+#define CMU_QCH_BCLK1           (soc9610 ? 0x3020u : 0x302Cu)   /* the speaker UAIF's Q-channel */
+#undef CMU_QCH_GPIO
+#define CMU_QCH_GPIO            (soc9610 ? 0x3040u : 0x304Cu)
+#undef GPIO_GPB1
+#define GPIO_GPB1               (soc9610 ? 0x0040u : 0x0020u)   /* the speaker UAIF's pins: gpb2 on the A50 */
+#undef ROUTE_UAIF1_SHIFT
+#define ROUTE_UAIF1_SHIFT       (4 * spk_uaif)
+#undef QCHANNEL_BCLK_UAIF1
+#define QCHANNEL_BCLK_UAIF1     (1u << (2 + spk_uaif))
+
 static int say(const char *format, ...) __printflike(1, 2);
 
 static int
@@ -236,9 +308,9 @@ struct block {
 };
 
 static struct block pmu = { "PMU", ABOX_PMU_PA, 0x5000, 0 };
-static struct block cmu = { "CMU_AUD", ABOX_CMU_PA, 0x8000, 0 };
+static struct block cmu = { "CMU_AUD", 0x17C00000u, 0x8000, 0 };     /* the S9's ABOX_CMU_PA; abox_soc= moves it */
 static struct block sysreg = { "SYSREG_AUD", ABOX_SYSREG_PA, 0x1000, 0 };
-static struct block abox = { "ABOX", ABOX_SFR_PA, 0x3000, 0 };   /* through the WDMAs (0x2000) */
+static struct block abox = { "ABOX", 0x17C50000u, 0x3000, 0 };   /* through the WDMAs (0x2000) */
 static struct block gpio = { "GPIO_AUD", ABOX_GPIO_PA, 0x1000, 0 };
 static struct block mmu = { "SYSMMU_ABOX", ABOX_SYSMMU_PA, 0x1000, 0 };
 
@@ -445,7 +517,11 @@ step_look(void)
 	on_at_boot = (status & 0xF) == 0xF;
 	say("abox: 1: the AUD domain is %s\n", on_at_boot ? "ON already (the boot left it so)" : (status & 0xF) == 0 ? "off" :
 	    "neither on nor off");
-	if (hakios_acpm_init(say)) {
+	if (soc9610) {
+		/* the 9610's ACPM: channel 0 is its FVP's, and a DVFS request before the FVP is attached stops the APM
+		 * (hakios.exynos_acpm.c, acpm9610=); its AUD domain is not this driver's to ask */
+		say("abox: 1: 9610: ACPM not asked\n");
+	} else if (hakios_acpm_init(say)) {
 		error = hakios_acpm_dvfs_get(ACPM_DVFS_AUD, &khz);
 		say("abox: 1: ACPM's AUD DVFS domain (%u): %s %u kHz\n", ACPM_DVFS_AUD, error == 0 ? "at" : "not read, error", error == 0 ?
 		    khz : (uint32_t)error);
@@ -473,6 +549,10 @@ step_power(void)
 		}
 		say("abox: 2: the AUD domain is on after %llu us\n", took);
 	}
+	if (soc9610 && on_at_boot) {
+		say("abox: 2: 9610: DISPAUD is on (the panel's): its DTZPC is the display's, already restored; no SMC\n");
+		goto answered;
+	}
 	say("abox: 2: about to make SMC %#x (1, %#x): the DTZPC restore Samsung's CAL makes once the AUD domain has power; "
 	    "Carbon, at EL2, passes it on to EL3\n", ABOX_SMC_PD_ONOFF, ABOX_DTZPC_ARG);
 	answer = smc(ABOX_SMC_PD_ONOFF, 1, ABOX_DTZPC_ARG, 0);
@@ -486,6 +566,7 @@ step_power(void)
 			return false;
 		}
 	}
+answered:
 	say("abox: 2: reading ABOX's IP_INDEX at %#x: should the run end here, the block does not answer the AP\n",
 	    ABOX_SFR_PA + ABOX_IP_INDEX);
 	id = peek(&abox, "IP_INDEX", ABOX_IP_INDEX);
@@ -566,7 +647,7 @@ step_clocks(void)
 	uint64_t took, hz;
 	int error;
 
-	if (dvfs_khz != 0) {
+	if (dvfs_khz != 0 && !soc9610) {
 		say("abox: 3: abox_dvfs=%u: asking ACPM to set the AUD DVFS domain (%u) to %u kHz\n", dvfs_khz, ACPM_DVFS_AUD, dvfs_khz);
 		error = hakios_acpm_dvfs_set(ACPM_DVFS_AUD, dvfs_khz);
 		say("abox: 3: ACPM answered %d\n", error);
@@ -585,11 +666,13 @@ step_clocks(void)
 	(void)peek(&cmu, "GATE RSTNSYNC_UAIF1", CMU_GATE_RSTN_UAIF1);
 	(void)peek(&sysreg, "BUS_COMPONENT_DRCG_EN", SYSREG_DRCG_EN);
 	(void)peek(&sysreg, "SNPS_EMA", SYSREG_SNPS_EMA);
-	(void)poke(&sysreg, "MISC_CON", SYSREG_MISC_CON, 1);
+	if (!soc9610) {
+		(void)poke(&sysreg, "MISC_CON", SYSREG_MISC_CON, 1);
+	}
 
 	/* the dividers first, while PLL_AUD may still be off: when it comes up, nothing downstream runs faster than meant */
 	if (!cmu_ratio("DIV_CLK_AUD_BUS", CMU_DIV_BUS, 0x7, AUD_DIV_BUS) ||
-	    !cmu_ratio("DIV_CLK_AUD_BUSP", CMU_DIV_BUSP, 0x3, AUD_DIV_BUSP) ||
+	    (!soc9610 && !cmu_ratio("DIV_CLK_AUD_BUSP", CMU_DIV_BUSP, 0x3, AUD_DIV_BUSP)) ||
 	    !cmu_ratio("DIV_CLK_AUD_AUDIF", CMU_DIV_AUDIF, 0x1FF, AUD_DIV_AUDIF) ||
 	    !cmu_ratio("DIV_CLK_AUD_UAIF1", CMU_DIV_UAIF1, 0x1FF, AUD_DIV_UAIF1) ||
 	    !cmu_ratio("MUX_CLK_AUD_UAIF1", CMU_MUX_UAIF1, 0x1, 0)) {
@@ -699,7 +782,7 @@ pins_toggle(const char *when)
 static void
 uaif1_enable(bool on)
 {
-	(void)poke_bits(&abox, on ? "UAIF1_CTRL0 (SPK_ENABLE)" : "UAIF1_CTRL0 (SPK_ENABLE off)", ABOX_UAIF_CTRL0(1),
+	(void)poke_bits(&abox, on ? "UAIF1_CTRL0 (SPK_ENABLE)" : "UAIF1_CTRL0 (SPK_ENABLE off)", ABOX_UAIF_CTRL0(spk_uaif),
 	    UAIF_SPK_ENABLE, on ? UAIF_SPK_ENABLE : 0);
 	uaif_on = on;
 }
@@ -711,9 +794,9 @@ step_uaif(void)
 
 	say("abox: 5: about to make UAIF1 the master of an I2S of 2 x %u bits (CTRL1 %#x, Samsung's NB_NF: BCLK_POLARITY 1, "
 	    "WS_POLAR 0)\n", HAKIOS_ABOX_SLOT_BITS, ctrl1);
-	(void)peek(&abox, "UAIF1_STATUS", ABOX_UAIF_STATUS(1));
-	(void)poke_bits(&abox, "UAIF1_CTRL0", ABOX_UAIF_CTRL0(1), UAIF_SPK_ENABLE | UAIF_MODE_MASTER, UAIF_MODE_MASTER);
-	if (poke(&abox, "UAIF1_CTRL1", ABOX_UAIF_CTRL1(1), ctrl1) != ctrl1) {
+	(void)peek(&abox, "UAIF1_STATUS", ABOX_UAIF_STATUS(spk_uaif));
+	(void)poke_bits(&abox, "UAIF1_CTRL0", ABOX_UAIF_CTRL0(spk_uaif), UAIF_SPK_ENABLE | UAIF_MODE_MASTER, UAIF_MODE_MASTER);
+	if (poke(&abox, "UAIF1_CTRL1", ABOX_UAIF_CTRL1(spk_uaif), ctrl1) != ctrl1) {
 		return false;
 	}
 	if (bclk_on) {
@@ -724,7 +807,7 @@ step_uaif(void)
 	uaif1_enable(true);
 	spin_us(50000);
 	pins_toggle("with UAIF1 on");
-	(void)peek(&abox, "UAIF1_STATUS", ABOX_UAIF_STATUS(1));
+	(void)peek(&abox, "UAIF1_STATUS", ABOX_UAIF_STATUS(spk_uaif));
 	uaif1_enable(false);
 	return true;
 }
@@ -1082,6 +1165,11 @@ fill_period(uint32_t p, enum source source)
 		for (uint32_t i = 0; i < n; i++) {
 			period_buf[2 * i] = sink_ring[2 * ((tail + i) % SINK_FRAMES)];
 			period_buf[2 * i + 1] = sink_ring[2 * ((tail + i) % SINK_FRAMES) + 1];
+			if (soc9610 && !hp_on) {
+				/* the A50 has one speaker, on slot 0: both channels into it (half each, never clipped) */
+				period_buf[2 * i] = period_buf[2 * i + 1] =
+				    (int16_t)(((int32_t)period_buf[2 * i] + (int32_t)period_buf[2 * i + 1]) / 2);
+			}
 		}
 		OSMemoryBarrier();
 		sink_tail = tail + n;
@@ -1134,7 +1222,6 @@ static uint32_t clock_writes[3];        /* PLL_CON0, DIV AUDIF, DIV UAIF1 as lef
 /* the microphone for iOS and the headphones, followed from step 8's loop (their section is after the capture's) */
 static void follow_input(void);
 static void follow_headphones(void);
-static volatile bool hp_on;                     /* iOS's sound goes to UAIF0 (the codec, the headphones), not to UAIF1 */
 static uint32_t mic_for_ios;                    /* abox_mic: /dev/hakios-mic, fed through WDMA1 while iOS listens */
 
 static bool
@@ -1169,7 +1256,7 @@ stream_start(void)
 	clock_writes[1] = rd(&cmu, CMU_DIV_AUDIF);
 	clock_writes[2] = rd(&cmu, CMU_DIV_UAIF1);
 	say("abox: %u: about to start: UAIF1 first, then RDMA0 (%s), Samsung's order for these links\n", step, dma->name);
-	(void)peek(&abox, "UAIF1_STATUS", ABOX_UAIF_STATUS(1));
+	(void)peek(&abox, "UAIF1_STATUS", ABOX_UAIF_STATUS(spk_uaif));
 	uaif1_enable(true);
 	if (!dma->start()) {
 		return false;
@@ -1181,7 +1268,7 @@ stream_start(void)
 	say("abox: %u: RDMA0 STATUS each ms: %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x\n", step, s[0], s[1], s[2], s[3], s[4], s[5],
 	    s[6], s[7], s[8], s[9]);
 	(void)peek(&abox, "RDMA0_CTRL0", R0(RDMA_CTRL0));
-	(void)peek(&abox, "UAIF1_STATUS", ABOX_UAIF_STATUS(1));
+	(void)peek(&abox, "UAIF1_STATUS", ABOX_UAIF_STATUS(spk_uaif));
 	pins_toggle("with the stream on");
 	return true;
 }
@@ -1199,7 +1286,7 @@ stream_stop(void)
 	if (uaif_on) {
 		uaif1_enable(false);
 	}
-	(void)peek(&abox, "UAIF1_STATUS", ABOX_UAIF_STATUS(1));
+	(void)peek(&abox, "UAIF1_STATUS", ABOX_UAIF_STATUS(spk_uaif));
 	if (syspower && !rdma_on) {
 		(void)poke_bits(&abox, "QCHANNEL_DISABLE (as it was)", ABOX_QCHANNEL_DISABLE, QCHANNEL_ACLK | QCHANNEL_BCLK_UAIF1,
 		    qch_was);
@@ -1318,7 +1405,7 @@ stream_run(uint64_t tone_until_us, uint64_t until_us)
 			    (now - start) / 1000000, (now - start) / 100000 % 10, status, (status & RDMA_PROGRESS) ? 1u : 0u,
 			    RDMA_RBUF_OFFSET(status),
 			    RDMA_RBUF_CNT(status), rate, BYTES_PER_SECOND, by_clock ? " (refilled by the clock)" : "", refilled,
-			    rd(&abox, R0(RDMA_CTRL0)), rd(&abox, ABOX_UAIF_STATUS(1)));
+			    rd(&abox, R0(RDMA_CTRL0)), rd(&abox, ABOX_UAIF_STATUS(spk_uaif)));
 			if (steps >= 8) {
 				say("abox: 8: from iOS %llu frames (%llu lost), %llu fed, %llu periods short of frames\n", sink_frames, sink_lost,
 				    fed_frames, short_periods);
@@ -1400,8 +1487,8 @@ step_sink(void)
  * little-endian stereo at 48 kHz, "camshot ... RGB" in the header only because it rides that framing).
  */
 #define CMU_DIV_UAIF0           0x1824
-#define CMU_MUX_UAIF0           0x1004
-#define CMU_QCH_BCLK0           0x3028
+#define CMU_MUX_UAIF0           (soc9610 ? 0x1010u : 0x1004u)
+#define CMU_QCH_BCLK0           (soc9610 ? 0x3018u : 0x3028u)
 #define GPIO_GPB0               0x0000
 #define UAIF0_PINS_MASK         0xFFFF0u        /* gpb0-1..4 */
 #define UAIF0_PINS_FUNC         0x22220u
@@ -1986,9 +2073,9 @@ hakios_exynos_abox_quiesce(void)
 		stopped = wait_bits(&abox, R0(RDMA_CTRL0), RDMA_ENABLE, 0, DMA_STOP_US, &took);
 	}
 	spin_us(FIFO_FLUSH_US);
-	wr(&abox, ABOX_UAIF_CTRL0(1), rd(&abox, ABOX_UAIF_CTRL0(1)) & ~UAIF_SPK_ENABLE);
+	wr(&abox, ABOX_UAIF_CTRL0(spk_uaif), rd(&abox, ABOX_UAIF_CTRL0(spk_uaif)) & ~UAIF_SPK_ENABLE);
 	say("abox: at the run's end: RDMA0 %s (%llu us), UAIF1's SPK_ENABLE off (CTRL0 %#x)\n", stopped ? "stopped" :
-	    "has NOT said it stopped", took, rd(&abox, ABOX_UAIF_CTRL0(1)));
+	    "has NOT said it stopped", took, rd(&abox, ABOX_UAIF_CTRL0(spk_uaif)));
 }
 
 void
@@ -1999,7 +2086,22 @@ hakios_exynos_abox_init(void)
 	if (!PE_parse_boot_argn("abox", &steps, sizeof(steps)) || steps == 0) {
 		return;
 	}
-	if (pe_arm_get_soc_base_phys() != STARLTE_SOC_BASE) {
+	uint32_t soc = 0;
+
+	/* abox_soc=, or else the ACPM's acpm_soc= (the A50's boot-args are near the command line's limit) */
+	if ((PE_parse_boot_argn("abox_soc", &soc, sizeof(soc)) || PE_parse_boot_argn("acpm_soc", &soc, sizeof(soc))) &&
+	    soc == 9610) {
+		soc9610 = true;         /* the Galaxy A50: its blocks' addresses (above, "the Galaxy A50") */
+		spk_uaif = 2;
+		pmu.pa = 0x11860000;
+		cmu.pa = 0x14980000;    /* CMU_DISPAUD */
+		cmu.name = "CMU_DISPAUD";
+		sysreg.pa = 0x14810000; /* SYSREG_DISPAUD */
+		sysreg.name = "SYSREG_DISPAUD";
+		abox.pa = 0x14A50000;
+		gpio.pa = 0x14A60000;
+		mmu.pa = 0x14920000;
+	} else if (pe_arm_get_soc_base_phys() != STARLTE_SOC_BASE) {
 		return;                 /* not the Exynos 9810 */
 	}
 	steps = steps > STEPS ? STEPS : steps;
@@ -2122,8 +2224,8 @@ console_state(void)
 	    rd(&abox, ABOX_SYSPOWER_CTRL), rd(&abox, ABOX_SYSPOWER_STATUS), rd(&abox, ABOX_QCHANNEL_DISABLE),
 	    rd(&abox, ABOX_ROUTE_CTRL0), rd(&abox, ABOX_SPUS_CTRL0), rd(&abox, ABOX_SPUS_CTRL1), rd(&abox, ABOX_SPUS_SBANK_RDMA(0)));
 	say("abox> UAIF1 CTRL0 %#x CTRL1 %#x STATUS %#x; RDMA0 CTRL0 %#x CTRL1 %#x BUF %#x-%#x OFFSET %#x STR %#x VOL %#x "
-	    "LIMIT %#x STATUS %#x; SysMMU CTRL %#x\n", rd(&abox, ABOX_UAIF_CTRL0(1)), rd(&abox, ABOX_UAIF_CTRL1(1)),
-	    rd(&abox, ABOX_UAIF_STATUS(1)), rd(&abox, R0(RDMA_CTRL0)), rd(&abox, R0(RDMA_CTRL1)), rd(&abox, R0(RDMA_BUF_STR)),
+	    "LIMIT %#x STATUS %#x; SysMMU CTRL %#x\n", rd(&abox, ABOX_UAIF_CTRL0(spk_uaif)), rd(&abox, ABOX_UAIF_CTRL1(spk_uaif)),
+	    rd(&abox, ABOX_UAIF_STATUS(spk_uaif)), rd(&abox, R0(RDMA_CTRL0)), rd(&abox, R0(RDMA_CTRL1)), rd(&abox, R0(RDMA_BUF_STR)),
 	    rd(&abox, R0(RDMA_BUF_END)), rd(&abox, R0(RDMA_BUF_OFFSET)), rd(&abox, R0(RDMA_STR_POINT)),
 	    rd(&abox, R0(RDMA_VOL_FACTOR)), rd(&abox, R0(RDMA_SBACK_LIMIT)), rd(&abox, R0(RDMA_STATUS)), rd(&mmu, MMU_CTRL));
 }

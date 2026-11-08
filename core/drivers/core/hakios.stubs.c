@@ -196,6 +196,9 @@ void hakios_max98512_quiesce(void) {}
 void hakios_s6e3ha8_init(void) {}
 bool hakios_s6e3ha8_blank(__unused int (*say)(const char *, ...)) { return false; }      /* "not blanked" */
 #endif
+#ifndef HAKIOS_EA8076
+void hakios_ea8076_init(void) {}
+#endif
 
 #ifndef HAKIOS_EXYNOS_POWEROFF
 void hakios_exynos_halt_off(__unused boolean_t reboot) {}  /* a halt hands the phone to the loader, as it always did */
@@ -355,13 +358,13 @@ void hakios_mic_dsp_down(void) {}
 void hakios_mic_quiesce(void) {}
 #endif
 
-#ifndef HAKIOS_HAPTIC
+#if !defined(HAKIOS_HAPTIC) && !defined(HAKIOS_GPIO_VIB)
 void hakios_haptic_init(void) {}
 void hakios_haptic_quiesce(void) {}
 void hakios_haptic_pretend(__unused uint32_t peak) {}
 #endif
 
-#ifndef HAKIOS_TORCH
+#if !defined(HAKIOS_TORCH) && !defined(HAKIOS_SM5713)
 void hakios_torch_init(void) {}
 void hakios_torch_quiesce(void) {}
 #endif

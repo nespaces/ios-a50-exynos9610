@@ -46,6 +46,7 @@ void hakios_exynos_keys_init(void);    /* boot-arg exynos_keys=1: the Galaxy S9'
 void hakios_s6sy761_init(void);        /* boot-arg s6sy761=1: the Galaxy S9's touch screen (I2C) */
 void hakios_melfas_mss100_init(void);  /* boot-arg melfas=1: the Galaxy A50's touch screen (I2C) */
 void hakios_s6e3ha8_init(void);        /* boot-arg panel=1: the Galaxy S9's panel brightness (kern.hakios.brightness) */
+void hakios_ea8076_init(void);         /* boot-arg ea8076=1: the Galaxy A50's panel brightness (DCS 51) */
 void hakios_s2mpb02_torch_init(void);  /* boot-arg torch=N on the Galaxy S9: its flashlight (/dev/hakios-torch) */
 void hakios_exynos_pcie_init(void);    /* boot-arg wifi_pcie=N on the Galaxy S9: PCIe to the BCM4361, stage 1 */
 const char *hakios_bcm4361_module(void); /* the S9's radio module, "murata" or "semco", once Wi-Fi read its OTP; or NULL */
