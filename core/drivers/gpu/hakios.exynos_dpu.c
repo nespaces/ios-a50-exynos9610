@@ -199,7 +199,18 @@ static unsigned nbuffers;
 
 static inline uint32_t rd(vm_offset_t base, uint32_t offset) { return *(volatile uint32_t *)(base + offset); }
 static inline void wr(vm_offset_t base, uint32_t offset, uint32_t value) { *(volatile uint32_t *)(base + offset) = value; }
-static inline vm_offset_t idma(unsigned type) { return dma + 0x1000 * (type + 1); }
+/*
+ * The Galaxy A50 (Exynos 9610, dpu20): DECON_F at 0x148B0000 with the same DECON registers (dpu20/cal_9610/regs-decon.h:
+ * SHADOW_REG_UPDATE_REQ 0x60, DATA_PATH_CONTROL_1 0x218, FRAME_COUNT ...) and IDMA registers (regs-dpp.h: IN_BASE_ADDR_Y
+ * 0x40, SRC_SIZE 0x10, IMG_SIZE 0x18), but four DMA blocks at other places (the device tree's dpp nodes: 0x14891000,
+ * 0x14892000, 0x14896000, 0x14895000). S-Boot's framebuffer 0xCA000000, 1080 x 2340. Only fb_flip here: the block that
+ * reads S-Boot's buffer is found by its base address, and flips write that block alone; no scaler, no fb_zc pool (the
+ * S9's pool, 0xDEC00000 up, runs past the end of this phone's bank at 0xE0000000).
+ */
+static bool soc9610;
+static vm_offset_t idma9610;
+static const uint64_t dma9610_pa[4] = { 0x14891000ULL, 0x14892000ULL, 0x14896000ULL, 0x14895000ULL };
+static inline vm_offset_t idma(unsigned type) { return soc9610 ? idma9610 : dma + 0x1000 * (type + 1); }
 static inline vm_offset_t dppc(unsigned type) { return dpp + 0x1000 * (type + 1); }
 
 /* the shadow update taken (all of it: the DECON's request register reads 0); up to `ms` milliseconds */
@@ -220,6 +231,12 @@ dump_channel(const char *what, unsigned type)
 {
 	vm_offset_t i = idma(type), d = dppc(type);
 
+	if (soc9610) {
+		say("exynos_dpu: %s DMA%u: IDMA enable %x irq %x in %x out %x src %x offset %x img %x base %08x\n", what, type,
+		    rd(i, IDMA_ENABLE), rd(i, IDMA_IRQ), rd(i, IDMA_IN_CON), rd(i, IDMA_OUT_CON), rd(i, IDMA_SRC_SIZE),
+		    rd(i, IDMA_SRC_OFFSET), rd(i, IDMA_IMG_SIZE), rd(i, IDMA_BASE_Y));
+		return;
+	}
 	say("exynos_dpu: %s %s: IDMA enable %x irq %x in %x out %x src %x offset %x img %x base %08x/%08x deadlock %x "
 	    "bus %x gating %x dest %x cfg-err %x; DPP enable %x irq %x in %x img %x scaled %x ratio %x/%x cfg-err %x\n",
 	    what, type_name[type], rd(i, IDMA_ENABLE), rd(i, IDMA_IRQ), rd(i, IDMA_IN_CON), rd(i, IDMA_OUT_CON),
@@ -228,6 +245,83 @@ dump_channel(const char *what, unsigned type)
 	    rd(d, DPP_ENABLE), rd(d, DPP_IRQ), rd(d, DPP_IN_CON), rd(d, DPP_IMG_SIZE),
 	    type >= IDMA_VGF0 ? rd(d, DPP_SCALED_SIZE) : 0, type >= 2 ? rd(d, DPP_H_RATIO) : 0,
 	    type >= 2 ? rd(d, DPP_V_RATIO) : 0, rd(d, DPP_CFG_ERR));
+}
+
+/* the A50's: as below, with the DMA block found by the buffer it reads */
+static int
+probe9610(uint64_t fb_phys, uint32_t width, uint32_t height)
+{
+	uint32_t gc, path0, path1, on = 0;
+	int found = -1;
+
+	soc9610 = true;
+	decon = ml_io_map(0x148B0000UL, 0x2000);
+	if (decon == 0) {
+		say("exynos_dpu: 9610: cannot map DECON_F\n");
+		return -1;
+	}
+	gc = rd(decon, GLOBAL_CONTROL);
+	path0 = rd(decon, DATA_PATH_0);
+	path1 = rd(decon, DATA_PATH_1);
+	for (unsigned w = 0; w < WINDOWS; w++) {
+		if (path0 & (1u << (4 * w))) {
+			on++;
+			win = w;
+		}
+	}
+	say("exynos_dpu: 9610: DECON_F control %x (%s mode, %s), trigger %x, shadow request %x, windows %x (%u on), "
+	    "channels %x, frame count %u\n", gc, (gc & GC_CMD_MODE) ? "command" : "video", (gc & GC_RUN) ? "running" :
+	    "NOT running", rd(decon, TRIG_CONTROL), rd(decon, SHADOW_REQ), path0, on, path1, rd(decon, FRAME_COUNT));
+	if (on != 1 || !(gc & GC_CMD_MODE) || !(gc & GC_RUN)) {
+		say("exynos_dpu: 9610: not one window in command mode, running: the DECON is left alone\n");
+		return -1;
+	}
+	for (unsigned k = 0; k < 4; k++) {
+		vm_offset_t m = ml_io_map(dma9610_pa[k], 0x1000);
+		uint32_t base, img;
+
+		if (m == 0) {
+			continue;
+		}
+		base = rd(m, IDMA_BASE_Y);
+		img = rd(m, IDMA_IMG_SIZE);
+		say("exynos_dpu: 9610: DMA%u at %#llx: enable %x base %08x img %x src %x\n", k, dma9610_pa[k],
+		    rd(m, IDMA_ENABLE), base, img, rd(m, IDMA_SRC_SIZE));
+		/* (on the A50 IN_BASE_ADDR_Y and SRC_SIZE read 0 though the block scans S-Boot's buffer: matched by its size) */
+		if (found < 0 && (base == (uint32_t)fb_phys || base == 0) && img == (height << 16 | width)) {
+			found = (int)k;
+			idma9610 = m;
+		}
+	}
+	if (found < 0) {
+		say("exynos_dpu: 9610: no DMA block reads S-Boot's buffer: the DECON is left alone\n");
+		return -1;
+	}
+	{
+		/* the block's first 0x100 bytes and a write of IN_BASE_ADDR_Y read back (the same address: nothing changes) */
+		uint32_t w[64];
+
+		for (unsigned k = 0; k < 64; k++) {
+			w[k] = rd(idma9610, 4 * k);
+		}
+		for (unsigned k = 0; k < 64; k += 8) {
+			say("exynos_dpu: 9610: DMA%d +%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", found, 4 * k, w[k], w[k + 1],
+			    w[k + 2], w[k + 3], w[k + 4], w[k + 5], w[k + 6], w[k + 7]);
+		}
+		wr(idma9610, IDMA_BASE_Y, (uint32_t)fb_phys);
+		__asm__ volatile ("dsb sy" ::: "memory");
+		say("exynos_dpu: 9610: IN_BASE_ADDR_Y <- %#llx: reads %08x; SRC_SIZE %08x\n", fb_phys, rd(idma9610, IDMA_BASE_Y),
+		    rd(idma9610, IDMA_SRC_SIZE));
+	}
+	boot_type = channel_type = (unsigned)found;
+	boot_base = (uint32_t)fb_phys;
+	boot_data_path_1 = path1;
+	boot_win_start = rd(decon, WIN_START(win));
+	boot_win_end = rd(decon, WIN_END(win));
+	probed = 1;
+	say("exynos_dpu: 9610: probe: window %u on DMA%u reading %#llx: fb_flip may be asked for (no scaler, no pool)\n",
+	    win, boot_type, fb_phys);
+	return 0;
 }
 
 /*
@@ -244,6 +338,9 @@ hakios_scanout_probe(uint64_t fb_phys, uint32_t width, uint32_t height, uint32_t
 		return probed > 0 ? 0 : -1;
 	}
 	probed = -1;
+	if (fb_phys == 0xCA000000ULL && width == 1080 && height == 2340 && rowbytes == 1080 * 4) {
+		return probe9610(fb_phys, width, height);
+	}
 	if (fb_phys != 0xCC000000ULL || width != 1440 || height != 2960 || rowbytes != 1440 * 4) {
 		say("exynos_dpu: the boot framebuffer is at %#llx, %ux%u, %u bytes a row: not the S9's (0xcc000000, "
 		    "1440x2960): the DECON is left alone\n", fb_phys, width, height, rowbytes);
@@ -370,7 +467,7 @@ hakios_scanout_memory(uint64_t bytes, unsigned count, uint64_t *phys)
 int
 hakios_scanout_carve(uint64_t bytes, uint64_t *phys)
 {
-	if (probed <= 0 || bytes == 0 || bytes > SCAN_SLOT) {
+	if (probed <= 0 || soc9610 || bytes == 0 || bytes > SCAN_SLOT) {
 		return -1;
 	}
 	for (unsigned k = 0; k < SCAN_SLOTS; k++) {
@@ -401,7 +498,7 @@ hakios_scanout_uncarve(uint64_t phys)
 int
 hakios_scanout_carved(uint64_t phys)
 {
-	return probed > 0 && phys >= SCAN_POOL_PA && phys < SCAN_POOL_PA + SCAN_SLOT * SCAN_SLOTS;
+	return probed > 0 && !soc9610 && phys >= SCAN_POOL_PA && phys < SCAN_POOL_PA + SCAN_SLOT * SCAN_SLOTS;
 }
 
 /*
@@ -682,8 +779,9 @@ hakios_scanout_attach(int want, const uint64_t *phys, unsigned count, uint32_t w
 	}
 	nbuffers = count;
 	if (want == 1) {
-		if (width != (rd(idma(boot_type), IDMA_IMG_SIZE) & 0x1fff) || rowbytes != (rd(idma(boot_type), IDMA_SRC_SIZE) &
-		    0xffff) * 4) {
+		/* (the A50's SRC_SIZE reads 0: its rows are taken as the boot framebuffer's, width x 4) */
+		if (width != (rd(idma(boot_type), IDMA_IMG_SIZE) & 0x1fff) || rowbytes != (soc9610 ? width * 4 :
+		    (rd(idma(boot_type), IDMA_SRC_SIZE) & 0xffff) * 4)) {
 			say("exynos_dpu: flips need buffers like the boot one (%u wide, %u bytes a row; given %u, %u)\n",
 			    rd(idma(boot_type), IDMA_IMG_SIZE) & 0x1fff, (rd(idma(boot_type), IDMA_SRC_SIZE) & 0xffff) * 4, width,
 			    rowbytes);
@@ -691,14 +789,14 @@ hakios_scanout_attach(int want, const uint64_t *phys, unsigned count, uint32_t w
 		}
 		mode = 1;
 		channel_type = boot_type;
-		say("exynos_dpu: flips on %s between %u buffers (%08llx ...), each taken at a refresh\n", type_name[boot_type],
-		    count, phys[0]);
+		say("exynos_dpu: flips on %s%u between %u buffers (%08llx ...), each taken at a refresh\n",
+		    soc9610 ? "DMA" : type_name[boot_type], soc9610 ? boot_type : 0, count, phys[0]);
 		if (buffers[shown] != boot_base) {
 			hakios_scanout_flip(shown);
 		}
 		return 0;
 	}
-	if (want == 2 && attach_vgf0(phys[shown], width, height, rowbytes) == 0) {
+	if (want == 2 && !soc9610 && attach_vgf0(phys[shown], width, height, rowbytes) == 0) {
 		scan_rowbytes = shown_rowbytes = rowbytes;
 		say("exynos_dpu: VGF0 scales %ux%u to the panel; flips between %u buffers\n", width, height, count);
 		return 0;

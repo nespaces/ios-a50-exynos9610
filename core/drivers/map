@@ -14,6 +14,7 @@ input    bsd/dev/hakios.input.c
 input    bsd/dev/hakios.buttons.c
 input    bsd/dev/hakios.exynos_keys.c
 input    bsd/dev/hakios.s6sy761.c
+input    bsd/dev/hakios.melfas_mss100.c
 input    bsd/dev/hakios.ssp.c
 input    bsd/dev/hakios.bcm_shub.h
 input    bsd/dev/hakios.virtio_input.c
@@ -59,6 +60,7 @@ audio    bsd/dev/hakios.cs47l93.c
 power    bsd/dev/hakios.battery.c
 power    iokit/Kernel/hakios.battery.cpp
 power    bsd/dev/hakios.max77705.c
+power    bsd/dev/hakios.sm5713.c
 power    bsd/dev/hakios.exynos_cpufreq.c
 power    bsd/dev/hakios.exynos_tmu.c
 power    bsd/dev/hakios.exynos_tmu.h
@@ -89,6 +91,7 @@ core     bsd/dev/hakios.stubs.c
 core     bsd/dev/hakios.exynos_hsi2c.c
 core     bsd/dev/hakios.exynos_spi.c
 core     bsd/dev/hakios.exynos_acpm.c
+core     bsd/dev/hakios.exynos9610_fvp.h
 core     bsd/dev/hakios.exynos_m3.c
 core     bsd/dev/hakios.dwc3.c
 core     bsd/dev/hakios.usb_acm.h

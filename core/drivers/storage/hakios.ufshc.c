@@ -345,6 +345,13 @@ extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
  */
 #define UFSHC_S9_MEM_PA     EXYNOS9810_MEM_UFS_PA
 #define UFSHC_S9_MEM_BYTES  EXYNOS9810_MEM_SIZE(UFS)
+/*
+ * The A50's (Exynos 9610): XNU has the bank from 0x880000000 alone here too, and 4 MB at the same 0xDA000000 of the
+ * lower bank is outside everything the loader keeps out (xnuloader/loader.c, platform_a50: the framebuffer at
+ * 0xCA000000, the payload moved to 0xD0000000..0xD3FFFFFF, ABOX from 0xE9400000).
+ */
+#define UFSHC_A50_MEM_PA    0xDA000000ULL
+#define UFSHC_A50_MEM_BYTES 0x400000ULL
 
 struct ufshc_soc {
 	const char *name;
@@ -366,6 +373,9 @@ struct ufshc_soc {
 	const char *(*adopt)(void);             /* own mode: the vendor's registers looked at and kept; why not */
 	void (*nexus)(uint32_t slot, bool scsi);        /* before every doorbell */
 	void (*give_back)(void);                /* at the end: what adopt kept */
+	uint64_t unipro_pa, pma_pa;             /* exynos: UniPro and the M-PHY's PMA, read by look() */
+	uint64_t pmu_phy_pa, coh_pa;            /* exynos: PMU UFS_PHY_CONTROL; SYSREG_FSYS's coherency bits 8-9 */
+	uint32_t lanes;                         /* exynos: the lanes the device tree asks for (PMA read per lane) */
 };
 
 static const char *exynos_look(bool link);
@@ -397,6 +407,26 @@ static const struct ufshc_soc hc_socs[] = {
 		 */
 		.default_slots = 1, .cnr = true,
 		.look = exynos_look, .adopt = exynos_adopt, .nexus = exynos_nexus, .give_back = exynos_give_back,
+		.unipro_pa = 0x11110000ULL, .pma_pa = 0x11124000ULL, .pmu_phy_pa = 0x14060724ULL, .coh_pa = 0x11010700ULL,
+		.lanes = 2,
+	},
+	{
+		/*
+		 * The Galaxy A50's (SM-A505FN): its device tree's ufs@0x13520000 (HCI 0x13520000, vendor 0x13521100,
+		 * UniPro 0x13510000, ufs-phy 0x13524000; one lane at HS-G3), PMU 0x11860000 + 0x724 (ufs-exynos.c's
+		 * default cxt_iso), SYSREG_FSYS 0x13410000 + 0x1010 (ufs-dma-coherency). The same controller family as the
+		 * 9810's in Samsung's 4.14 kernel for the A50 (drivers/scsi/ufs/ufs-exynos.c: PRDT entry size 12, byte
+		 * granular, DMA mask 32 bits): taken as S-Boot left it.
+		 */
+		.name = "exynos9610", .pa = 0x13520000, .size = 0x200, .vs_pa = 0x13521100, .vs_size = 0x200,
+		.prdt_bytes = true, .prd_entry = 128, .prd_max = 4096, .rsp_offset = 1024, .rsp_length = 1024,
+		.prdt_offset = 2048, .clear_with_ones = true, .dma32 = true, .slot_buffer = 64u << 10,
+		.default_step = 1, .dma_lo = 0x80000000ULL, .dma_hi = 0x100000000ULL,
+		.carve_pa = UFSHC_A50_MEM_PA, .carve_size = UFSHC_A50_MEM_BYTES,
+		.default_slots = 1, .cnr = true,
+		.look = exynos_look, .adopt = exynos_adopt, .nexus = exynos_nexus, .give_back = exynos_give_back,
+		.unipro_pa = 0x13510000ULL, .pma_pa = 0x13524000ULL, .pmu_phy_pa = 0x11860724ULL, .coh_pa = 0x13411010ULL,
+		.lanes = 1,
 	},
 };
 #define SOC_SHARED          (&hc_socs[1])       /* the one shared mode knows: the POCO's */
@@ -489,6 +519,14 @@ static uint64_t hc_writes, hc_write_bytes, hc_protocol_errors;
 static char hc_take_why[160];                   /* ufs=3: why own mode was not taken (ufshc_take_why) */
 static const uint8_t *hc_layout_ref;            /* ufs=3: the loader's blocks 0.. of its unit 0 (ufshc_take) */
 static uint32_t hc_layout_ref_blocks;
+/*
+ * ufs_native_ref_fnv=: the reference as a hash instead, FNV-1a (64 bits) of LUN 0's blocks 0-1 as read on the host
+ * (the A50: no UEFI, so no loader that reads them; TWRP's dd of /dev/block/sda, 8192 bytes). ufs_native_prd=: the
+ * PRDT entry size when UEFI left no read of its to tell it by (16, or 128 as the Exynos FMP's); the layout read
+ * proves either.
+ */
+static uint64_t hc_layout_ref_fnv;
+static uint32_t hc_prd_arg;
 
 static LCK_GRP_DECLARE(hc_lck_grp, "hakios-ufshc");
 static LCK_MTX_DECLARE(hc_lock, &hc_lck_grp);
@@ -646,12 +684,12 @@ hc_dma_sync(const volatile void *p, size_t bytes)
 #define EXY_CLKSTOP_MPHY_APB    (1u << 3)
 
 /* the blocks beside the controller, read and never written here */
-#define EXY_UNIPRO_PA           0x11110000ULL   /* the ufs node's third reg, 32 KB */
+#define EXY_UNIPRO_PA           (hc_soc->unipro_pa)     /* the ufs node's third reg, 32 KB */
 #define EXY_UNIPRO_SIZE         0x8000
-#define EXY_PMA_PA              0x11124000ULL   /* ufs-phy, 2 KB: the M-PHY's PMA */
+#define EXY_PMA_PA              (hc_soc->pma_pa)        /* ufs-phy, 2 KB: the M-PHY's PMA */
 #define EXY_PMA_SIZE            0x800
-#define EXY_PMU_PHY_PA          0x14060724ULL   /* ufs-phy-sys: PMU UFS_PHY_CONTROL, bit 0 the isolation bypassed */
-#define EXY_SYSREG_COH_PA       0x11010700ULL   /* ufs-io-coherency: SYSREG_FSYS0, bits 8-9 */
+#define EXY_PMU_PHY_PA          (hc_soc->pmu_phy_pa)    /* ufs-phy-sys: PMU UFS_PHY_CONTROL, bit 0 the isolation bypassed */
+#define EXY_SYSREG_COH_PA       (hc_soc->coh_pa)        /* ufs-io-coherency: SYSREG_FSYS0, bits 8-9 */
 #define EXY_SYSREG_COH_BITS     0x300u
 #define UNIP_COMP_VERSION       0x0000
 #define UNIP_COMP_INFO          0x0004
@@ -729,7 +767,7 @@ exynos_look(bool link)
 	} else {
 		vm_offset_t m = ml_io_map((vm_offset_t)EXY_PMA_PA, EXY_PMA_SIZE);
 
-		for (uint32_t lane = 0; m != 0 && lane < 2; lane++) {
+		for (uint32_t lane = 0; m != 0 && lane < hc_soc->lanes; lane++) {
 #define PMA(r) (*(volatile uint32_t *)(m + PMA_TRSV(r, lane)) & 0xff)
 			uint32_t c8 = PMA(0xc8), r120 = PMA(0x120), r128 = PMA(0x128), r134 = PMA(0x134), afc = PMA(PMA_CDR_AFC);
 #undef PMA
@@ -2691,6 +2729,11 @@ hc_boot_args(void)
 		hc_slot_buffer = hc_soc->slot_buffer;
 	}
 	PE_parse_boot_argn("ufs_native_leave", &hc_leave, sizeof(hc_leave));
+	PE_parse_boot_argn("ufs_native_ref_fnv", &hc_layout_ref_fnv, sizeof(hc_layout_ref_fnv));
+	PE_parse_boot_argn("ufs_native_prd", &hc_prd_arg, sizeof(hc_prd_arg));
+	if (hc_prd_arg != 16 && hc_prd_arg != 128) {
+		hc_prd_arg = 0;
+	}
 	PE_parse_boot_argn("ufs_native_hang", &hc_hang_after, sizeof(hc_hang_after));
 	PE_parse_boot_argn("ufs_native_spin", &hc_spin_us, sizeof(hc_spin_us));
 	if (hc_spin_us > 5000) {
@@ -3291,7 +3334,7 @@ ufshc_own_probe(void)
 	char name[32] = "pci";
 
 	PE_parse_boot_argn("ufs_native", &mode, sizeof(mode));
-	/* ufs_native_soc=NAME: the controller own mode takes: pci (QEMU's, the default), sm7325, exynos9810 */
+	/* ufs_native_soc=NAME: the controller own mode takes: pci (QEMU's, the default), sm7325, exynos9810, exynos9610 */
 	(void)PE_parse_boot_arg_str("ufs_native_soc", name, sizeof(name));
 	return hc_own_probe(name, mode, 0);
 }
@@ -3331,7 +3374,7 @@ hc_layout_read(void)
 	uint32_t saved = hc_pol.read_luns, first = 0, diff = 0;
 	int e = EIO;
 
-	if (hc_layout_ref == NULL || hc_layout_ref_blocks < 2) {
+	if ((hc_layout_ref == NULL || hc_layout_ref_blocks < 2) && hc_layout_ref_fnv == 0) {
 		return "no reference read of the loader's to check this driver's layout against";
 	}
 	if (s->data_size < sizeof(got)) {
@@ -3359,12 +3402,22 @@ hc_layout_read(void)
 		    hc_slots[SLOT_CONTROL].utrd[2] & 0xff, hc_read(UFSHC_UTRLDBR), hc_read(UFSHC_IS));
 		return "the layout read (READ(10) of LUN 0, LBA 0-1, this driver's descriptor) failed";
 	}
-	for (uint32_t i = 0; i < sizeof(got); i++) {
-		if (got[i] != hc_layout_ref[i]) {
-			if (diff++ == 0) {
-				first = i;
+	if (hc_layout_ref != NULL && hc_layout_ref_blocks >= 2) {
+		for (uint32_t i = 0; i < sizeof(got); i++) {
+			if (got[i] != hc_layout_ref[i]) {
+				if (diff++ == 0) {
+					first = i;
+				}
 			}
 		}
+	} else {
+		uint64_t h = 0xcbf29ce484222325ULL;
+
+		for (uint32_t i = 0; i < sizeof(got); i++) {
+			h = (h ^ got[i]) * 0x100000001b3ULL;
+		}
+		hc_say("ufs: own: layout read: FNV-1a %016llx, the host's ufs_native_ref_fnv= %016llx\n", h, hc_layout_ref_fnv);
+		diff = h == hc_layout_ref_fnv ? 0 : 1;
 	}
 	hc_say("ufs: own: layout read: LUN 0's blocks 0-1 through this driver's descriptor (PRDT entries of %u bytes, "
 	    "offsets in %s): %s the loader's (%u of %u bytes differ%s%u; here %02x %02x %02x %02x ... %02x %02x at 510)\n",
@@ -3396,7 +3449,7 @@ hc_own_probe(const char *name, uint32_t mode, uint32_t step)
 	}
 	if (hc_soc == NULL) {
 		hc_soc = SOC_SHARED;
-		hc_say("ufs: own: ufs_native_soc=%s: no such controller (pci, sm7325, exynos9810)\n", name);
+		hc_say("ufs: own: ufs_native_soc=%s: no such controller (pci, sm7325, exynos9810, exynos9610)\n", name);
 		return false;
 	}
 	hc_slot_buffer = hc_soc->slot_buffer;
@@ -3469,13 +3522,14 @@ hc_own_probe(const char *name, uint32_t mode, uint32_t step)
 				 * UEFI's leftovers do not decide (ro6: a read of its whose table this file misread): said, and
 				 * the layout read -- this driver's own READ of LUN 0's blocks 0-1 against the loader's -- does.
 				 */
-				hc_soc_own.prd_entry = 16;
-				if (hc_layout_ref == NULL && hc_step >= 4) {
+				hc_soc_own.prd_entry = hc_prd_arg != 0 ? hc_prd_arg : 16;
+				if (hc_layout_ref == NULL && hc_layout_ref_fnv == 0 && hc_step >= 4) {
 					no = "UEFI's own read is not laid out as this driver would lay out its own, and no reference to "
 					    "read against";
 				} else {
 					hc_say("ufs: own: UEFI's leftover read is not laid out as this driver reads it (above): not "
-					    "decisive; PRDT entries of 16 bytes, to be proven by the layout read before anything else\n");
+					    "decisive; PRDT entries of %u bytes, to be proven by the layout read before anything else\n",
+					    hc_soc_own.prd_entry);
 				}
 			} else if (hc_soc->prdt_bytes && verdict == 0) {
 				/*
@@ -3484,12 +3538,12 @@ hc_own_probe(const char *name, uint32_t mode, uint32_t step)
 				 * 128-byte entry, so a controller on 128 has no entry to write into and the layout
 				 * read fails; one on 16 reads. The layout read before anything else decides.
 				 */
-				hc_soc_own.prd_entry = 16;
-				if (hc_layout_ref == NULL && hc_step >= 4) {
+				hc_soc_own.prd_entry = hc_prd_arg != 0 ? hc_prd_arg : 16;
+				if (hc_layout_ref == NULL && hc_layout_ref_fnv == 0 && hc_step >= 4) {
 					no = "no read of UEFI's to check this driver's layout against, and no reference to read against";
 				} else {
-					hc_say("ufs: own: no read of UEFI's to check this driver's layout against: PRDT entries of 16 "
-					    "bytes, to be proven by the layout read before anything else is read\n");
+					hc_say("ufs: own: no read of UEFI's to check this driver's layout against: PRDT entries of %u "
+					    "bytes, to be proven by the layout read before anything else is read\n", hc_soc_own.prd_entry);
 				}
 			} else if (hc_soc->prdt_bytes) {
 				hc_say("ufs: own: UEFI's own read agrees with this driver's layout (PRDT entries of %u bytes): the layout "

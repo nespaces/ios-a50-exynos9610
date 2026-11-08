@@ -1,0 +1,4 @@
+# HakiOS defconfig for the Samsung Galaxy A50 (a50): the common kernel, the exynos9610 family's facts, and this device's own.
+#include common_defconfig
+#include exynos9610.config
+#include a50.config

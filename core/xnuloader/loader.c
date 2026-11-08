@@ -249,9 +249,9 @@ flush_dcache(uint64_t start, uint64_t end)
 {
 	uint64_t line = 4ULL << ((READ_SYSREG(CTR_EL0) >> 16) & 0xF);
 	for (uint64_t p = start & ~(line - 1); p < end; p += line) {
-		__asm__ volatile ("dc civac, %0" : : "r" (p));
+		__asm__ volatile ("dc civac, %0" : : "r" (p) : "memory");
 	}
-	__asm__ volatile ("dsb sy");
+	__asm__ volatile ("dsb sy" ::: "memory");
 }
 
 static void
@@ -259,9 +259,9 @@ clean_dcache(uint64_t start, uint64_t end)
 {
 	uint64_t line = 4ULL << ((READ_SYSREG(CTR_EL0) >> 16) & 0xF);
 	for (uint64_t p = start & ~(line - 1); p < end; p += line) {
-		__asm__ volatile ("dc cvac, %0" : : "r" (p));
+		__asm__ volatile ("dc cvac, %0" : : "r" (p) : "memory");
 	}
-	__asm__ volatile ("dsb sy");
+	__asm__ volatile ("dsb sy" ::: "memory");
 }
 
 /* ------------------------------------------------------------------------ */
@@ -943,6 +943,74 @@ static const struct platform platform_frankel = {
  * so the core numbering is QEMU's (core_shift 0); the Pixel's, Aff1, is redwood's. Told apart by the root "compatible"
  * of the test's device tree.
  */
+static const struct platform platform_a50 = {
+	/*
+	 * Samsung Galaxy A50 (SM-A505FN, a50), Exynos 9610, bare metal: the device's own boot shim
+	 * (devices/a50/soc/shim, the Tensor G5 shim's design) starts this loader, no UEFI. Every value is from
+	 * the phone's live device tree, read in TWRP (devices/a50/README.md): the GIC-400 (distributor
+	 * 0x12301000, CPU interface 0x12302000), the timer at 26 MHz, PSCI by SMC, the PMU at 0x11860000, both
+	 * cluster watchdogs at the S9's addresses, the panel's buffer at 0xCA000000 (1080 x 2340,
+	 * s3cfb.bootloaderfb= in the tree's bootargs). Told apart by the tree's "samsung,exynos9610".
+	 */
+	.name = "a50", .compatible = "samsung,exynos9610",
+	.io_base = 0x10000000, .io_size = 0x10000000,
+	.gic_dist = 0x12301000, .gic_cpu = 0x12302000, .uart = 0,
+	/*
+	 * Cores 0-3 are Cortex-A53s (MPIDR 0x000-0x003), 4-7 Cortex-A73s (0x100-0x103), all ARMv8.0: no PAN on
+	 * any of them (the kernel's own check, xnu/patches/1509) and isa_floor=1 for user space (1510). The
+	 * kernel runs on the A53s 2 and 3 (cpus=2 bootcpu=2), as on the S9; the A73s are untried.
+	 */
+	.cores = 8, .core_mpidr = (const uint32_t[]){ 0x000, 0x001, 0x002, 0x003, 0x100, 0x101, 0x102, 0x103 },
+	.small_cores = 0x0f,
+	/* CNTFRQ_EL0 may be 0 here as on the 9810; the tree's timer says 26 MHz. */
+	.timer_hz = 26000000,
+	.fb_base = 0xCA000000,
+	/*
+	 * Samsung's pstore (the live tree's debug-snapshot log_pstore, 0xF9D10000 + 2 MB): its first 256 KB for
+	 * the start of the kernel's log, the second megabyte's start for the log kept across a restart.
+	 */
+	.ram_log = 0xF9E90000, .ram_log_size = 0x80000,
+	.ram_dump = 0xF9D10000, .ram_dump_size = 0x80000,
+	.log_other_cpu = 1,
+	/*
+	 * The PMU (system-controller@11860000): INFORM2/3 (+0x808/+0x80C) and SWRESET (+0x400), the same layout
+	 * the S9's PMU has -- on this phone written, not yet seen to send a restart to recovery.
+	 */
+	.recovery_pmu = 0x11860000, .pmu_swreset = 0x400,
+	.data_part = "USERDATA",
+	/*
+	 * The cluster watchdogs as on the S9 (watchdog_cl1@10060000 armed, watchdog_cl0@10050000 stopped); the
+	 * PMU bit for the 9610 is the 9810's until checked (wdt=0 keeps everything off).
+	 */
+	.exynos_wdt = 0x10060000, .exynos_wdt_other = 0x10050000, .exynos_wdt_pmu_bit = 23,
+	/*
+	 * Not seen on this phone and guessed from the S9: S-Boot parks core 1 (parked_cores), and PSCI's
+	 * AFFINITY_INFO is not believed (affinity_unreliable).
+	 */
+	.parked_cores = 0x2, .affinity_unreliable = 1,
+	/*
+	 * The payload lands at 0xF0000000, inside the modem's window (the CP is not running: S-Boot does not
+	 * start it), so it is moved out first, to 0xD0000000: inside the 0xC0000000 bank, past the framebuffer,
+	 * where the device tree reserves nothing.
+	 */
+	.payload_home = 0xD0000000,
+	.keep_out = {
+		{ 0x80000000, 0x00002000, "sec_debug_magic, kaslr" },
+		{ 0x87000000, 0x00200000, "the EL2 hypervisor's (el2,uh)" },
+		{ 0xB8000000, 0x00500000, "vipx_fw_code_rmem" },
+		{ 0xC0000000, 0x00080000, "seclog_mem" },
+		{ 0xCA000000, 0x01000000, "S-Boot framebuffer" },
+		{ 0xE9400000, 0x02800000, "ABOX: abox_rmem" },
+		{ 0xED000000, 0x08A00000, "CP: modem_if" },
+		{ 0xF5A00000, 0x01E00000, "CP: cp_ram_logging" },
+		{ 0xF8E00000, 0x00200000, "bcm_setup" },
+		{ 0xF9000000, 0x02000000, "exynos snapshot and pstore" },
+		{ 0xFB000000, 0x00800000, "gnss_if" },
+		{ 0xFD000000, 0x00080000, "chub_rmem" },
+		{ 0x8FE600000ULL, 0x01A00000, "the EL2 hypervisor's earlymem" },
+	},
+};
+
 static const struct platform platform_qemu_lga = {
 	.name = "qemu-lga", .compatible = "scion,qemu-lga",
 	.io_base = 0x08000000, .io_size = 0x08000000,
@@ -960,6 +1028,7 @@ static const struct platform *const platforms[] = {
 	&platform_redwood,
 	&platform_starlte,
 	&platform_frankel,
+	&platform_a50,
 	&platform_qemu_lga,
 };
 
@@ -1571,8 +1640,14 @@ __asm__ (
         "  mrs x9, tpidrro_el0\n   str x9, [x10, #296]\n"
         "  mrs x9, contextidr_el1\n str x9, [x10, #312]\n"
         "  mrs x9, mdscr_el1\n     str x9, [x10, #320]\n"
-        "  mrs x9, s3_3_c4_c4_0\n          str x9, [x10, #328]\n"
-        "  mrs x9, s3_3_c4_c4_1\n          str x9, [x10, #336]\n"
+        "  mov x9, #0\n"
+        "  mrs x11, id_aa64mmfr1_el1\n  ubfx x11, x11, #20, #4\n"
+        "  cbz x11, 8f\n  mrs x9, s3_3_c4_c4_0\n8:\n"
+        "  str x9, [x10, #328]\n"
+        "  mov x9, #0\n"
+        "  mrs x11, id_aa64mmfr2_el1\n  ubfx x11, x11, #4, #4\n"
+        "  cbz x11, 8f\n  mrs x9, s3_3_c4_c4_1\n8:\n"
+        "  str x9, [x10, #336]\n"
         /* GICv3 CPU interface: the kernel reprograms it for its own interrupts */
         "  adrp x11, loader_gic_sysregs\n"
         "  ldr  x11, [x11, :lo12:loader_gic_sysregs]\n"
@@ -1601,8 +1676,10 @@ __asm__ (
         /* PSTATE bits the kernel may have left set. PAN in particular is fatal:
          * UEFI maps its memory as EL0-accessible, so with PAN every data access
          * (including the exception handler's own stack push) faults. */
-        "  .inst 0xd500409f\n"          /* msr PAN, #0 */
-        "  .inst 0xd500407f\n"          /* msr UAO, #0 */
+        "  mrs x9, id_aa64mmfr1_el1\n  ubfx x9, x9, #20, #4\n"
+        "  cbz x9, 8f\n  .inst 0xd500409f\n8:\n"
+        "  mrs x9, id_aa64mmfr2_el1\n  ubfx x9, x9, #4, #4\n"
+        "  cbz x9, 8f\n  .inst 0xd500407f\n8:\n"
         "  mrs x9, sctlr_el1\n"
         "  bic x9, x9, #0x1\n"
         "  bic x9, x9, #0x4\n"
@@ -1644,8 +1721,12 @@ __asm__ (
         "  ldr x9, [x10, #360]\n msr icc_bpr1_el1, x9\n"
         "  ldr x9, [x10, #352]\n msr icc_igrpen1_el1, x9\n"
         "3:\n"
-        "  ldr x9, [x10, #328]\n msr s3_3_c4_c4_0, x9\n"
-        "  ldr x9, [x10, #336]\n msr s3_3_c4_c4_1, x9\n"
+        "  mrs x11, id_aa64mmfr1_el1\n  ubfx x11, x11, #20, #4\n"
+        "  cbz x11, 8f\n  ldr x9, [x10, #328]\n"
+        "  msr s3_3_c4_c4_0, x9\n8:\n"
+        "  mrs x11, id_aa64mmfr2_el1\n  ubfx x11, x11, #4, #4\n"
+        "  cbz x11, 8f\n  ldr x9, [x10, #336]\n"
+        "  msr s3_3_c4_c4_1, x9\n8:\n"
         "  ldr x9, [x10, #104]\n msr cntkctl_el1, x9\n"
         "  ldr x9, [x10, #80]\n  msr cntv_cval_el0, x9\n"
         "  ldr x9, [x10, #72]\n  msr cntv_ctl_el0, x9\n"
@@ -1729,6 +1810,13 @@ __asm__ (
         ".balign 64\n"
         ".globl other_cpu_entry\n"
         "other_cpu_entry:\n"                    /* x0 = &other_cpu_start; MMU and caches are off */
+        /* Publish arrival before accessing any EL1 system register. */
+        "  adrp x9, other_cpu_stage\n"
+        "  add x9, x9, :lo12:other_cpu_stage\n"
+        "  mov x10, #1\n"
+        "  str x10, [x9]\n"
+        "  dsb sy\n"
+
         "  msr daifset, #0xf\n"
         /* until the kernel has vectors of its own, an exception must not go nowhere */
         "  adrp x9, other_cpu_vectors\n"
@@ -1777,8 +1865,10 @@ __asm__ (
         ".globl other_cpu_return_stub\n"
         "other_cpu_return_stub:\n"              /* x0..x7 as for loader_return_stub */
         "  msr daifset, #0xf\n"
-        "  .inst 0xd500409f\n"                  /* msr PAN, #0 */
-        "  .inst 0xd500407f\n"                  /* msr UAO, #0 */
+        "  mrs x9, id_aa64mmfr1_el1\n  ubfx x9, x9, #20, #4\n"
+        "  cbz x9, 8f\n  .inst 0xd500409f\n8:\n"
+        "  mrs x9, id_aa64mmfr2_el1\n  ubfx x9, x9, #4, #4\n"
+        "  cbz x9, 8f\n  .inst 0xd500407f\n8:\n"
         "  mrs x9, sctlr_el1\n"
         "  bic x9, x9, #0x1\n"
         "  bic x9, x9, #0x4\n"
@@ -4690,7 +4780,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 					print("core %x is the boot loader's (parked): not the kernel's\n", mpidr);
 					continue;
 				}
-				state = psci_call(PSCI_AFFINITY_INFO, mpidr, 0, 0);
+				/* (a 32-bit answer: the A50's PSCI 0.1 gives NOT_SUPPORTED as 0xffffffff in x0, not -1) */
+				state = (int32_t)psci_call(PSCI_AFFINITY_INFO, mpidr, 0, 0);
 				if (state == 1 || state == PSCI_NOT_SUPPORTED || (state == 0 && plat->affinity_unreliable)) {
 					cpu_mpidr[cpu_count++] = mpidr;
 				} else if (state >= 0) {
@@ -4875,7 +4966,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	/* ... and its other cores should all be off again: the next kernel cannot start one that is not */
 	for (int i = 1; i < cpu_count; i++) {
-		int64_t state = psci_call(PSCI_AFFINITY_INFO, cpu_mpidr[i], 0, 0);
+		int64_t state = (int32_t)psci_call(PSCI_AFFINITY_INFO, cpu_mpidr[i], 0, 0);
 
 		if (state != 1 && state != PSCI_NOT_SUPPORTED) {
 			print("THE KERNEL LEFT CORE %x RUNNING (the firmware says %d): restart before running another\n", cpu_mpidr[i],

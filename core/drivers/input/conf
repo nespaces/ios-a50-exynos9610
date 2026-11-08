@@ -29,6 +29,11 @@ driver S6SY761
 	help    the Galaxy S9's touch screen: a Samsung S6SY761 on the Exynos 9810's HSI2C of USI03, the bus driven by this
 	help    file (s6sy761=1; s6sy761_steps=N, s6sy761_ipclk=MHz)
 
+driver MELFAS_MSS100
+	file    bsd/dev/hakios.melfas_mss100.c
+	help    the Galaxy A50's touch screen: a Melfas MSS100 on the Exynos 9610's i2c_4 (the older Samsung I2C, polled by
+	help    this file) (melfas=1; melfas_steps=N, melfas_scale=, melfas_trace=N)
+
 driver SSP
 	file    bsd/dev/hakios.ssp.c
 	requires EXYNOS_SPI EXYNOS_ACPM

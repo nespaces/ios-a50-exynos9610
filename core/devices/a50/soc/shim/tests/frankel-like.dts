@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: MIT
+/*
+ * A device tree shaped like the one Google's boot loader hands a kernel on the Pixel 10, for the shim's host test
+ * (fdt-test.c). Written for this test, not copied: the addresses are the facts of the Tensor G5's trees (README.md names
+ * the files): the reserved regions of Google's lga-rmem.dtsi and the mainline lga.dtsi, the GIC and the UART of
+ * lga.dtsi. The RAM banks are an ASSUMPTION (12 GB: 2 GB at 0x80000000, 10 GB at 0x880000000, the 4-8 GB range
+ * unassigned as Google's tree says); the boot loader fills the real ones in, and the shim prints what it found.
+ */
+/dts-v1/;
+
+/memreserve/ 0x9b000000 0x00100000;
+
+/ {
+	model = "Frankel (test)";
+	compatible = "google,lga-frankel", "google,lga";
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	chosen {
+		bootargs = "console=ttyS0 scion.fb=0xbe400000,1080,2424,4320 scion.wdt=keep";
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x0 0x80000000 0x0 0x80000000>, <0x8 0x80000000 0x2 0x80000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		xhci_dma@9010000 { reg = <0x0 0x09010000 0x0 0x40000>; no-map; };
+		cpu_stats@8b20f000 { reg = <0x0 0x8b20f000 0x0 0x1000>; no-map; };
+		coresight@8b300000 { reg = <0x0 0x8b300000 0x0 0x100000>; no-map; };
+		bl31_log@8b600000 { reg = <0x0 0x8b600000 0x0 0x200000>; no-map; };
+		aoc@8d200000 { reg = <0x0 0x8d200000 0x0 0x3000000>; no-map; };
+		cdd@91200000 { reg = <0x0 0x91200000 0x0 0x400000>; no-map; };
+		ramoops@95200000 { compatible = "ramoops"; reg = <0x0 0x95200000 0x0 0x400000>; };
+		bldr_log@95600000 { reg = <0x0 0x95600000 0x0 0x100000>; no-map; };
+		tpu_fw@9fc00000 { reg = <0x0 0x9fc00000 0x0 0x1400000>; no-map; };
+		vpu_fw@a1000000 { reg = <0x0 0xa1000000 0x0 0x200000>; };
+		gsa_gme@a2400000 { reg = <0x0 0xa2400000 0x0 0x3db1000>; no-map; };
+		gpu_fw@b9f00000 { reg = <0x0 0xb9f00000 0x0 0x2100000>; no-map; };
+		abl@be000000 { reg = <0x0 0xbe000000 0x0 0x1000000>; no-map; };
+		s2m@c0000000 { reg = <0x0 0xc0000000 0x0 0x4a00000>; no-map; };
+		cp_rmem_1@e8000000 { reg = <0x0 0xe8000000 0x0 0x2000000>; };
+		cp_rmem@ea400000 { reg = <0x0 0xea400000 0x0 0xc00000>; };
+		cp_msi@f6200000 { reg = <0x0 0xf6200000 0x0 0x1000>; };
+		gc_rmem@f6fce000 { reg = <0x0 0xf6fce000 0x0 0x32000>; no-map; };
+		vframe { compatible = "shared-dma-pool"; size = <0x0 0x21400000>; reusable; };
+	};
+
+	soc@0 {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges = <0x0 0x0 0x0 0x0 0x10 0x0>;
+
+		interrupt-controller@5880000 {
+			compatible = "arm,gic-v3";
+			reg = <0x0 0x05880000 0x0 0x10000>, <0x0 0x05900000 0x0 0x200000>;
+		};
+
+		serial@db62000 {
+			compatible = "google,lga-uart", "snps,dw-apb-uart";
+			reg = <0x0 0x0db62000 0x0 0x100>;
+			reg-shift = <2>;
+			status = "disabled";
+		};
+	};
+};

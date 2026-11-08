@@ -106,8 +106,14 @@ void hakios_exynos_keys_init(void) {}
 #ifndef HAKIOS_S6SY761
 void hakios_s6sy761_init(void) {}
 #endif
+#ifndef HAKIOS_MELFAS_MSS100
+void hakios_melfas_mss100_init(void) {}
+#endif
 #ifndef HAKIOS_MAX77705
 void hakios_max77705_init(void) {}
+#endif
+#ifndef HAKIOS_SM5713
+void hakios_sm5713_init(void) {}
 #endif
 #ifndef HAKIOS_EXYNOS_CAMERA
 void hakios_exynos_camera_init(void) {}

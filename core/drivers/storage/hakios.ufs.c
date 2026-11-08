@@ -242,6 +242,7 @@ static const char *nufs_pname(uint32_t part);
 /* own mode (ufs_native=4): the table is this kernel's, the loader serves nothing */
 static bool ufs_own;
 static int ufs_own_write_part = -1;             /* the partition ufs_native_write= names; -1: none */
+static int ufs_own_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len);
 static struct loader_block *ufs_own_table;
 
 static LCK_GRP_DECLARE(ufs_lck_grp, "hakios-ufs");
@@ -747,6 +748,12 @@ ufs_write(uint32_t op, uint32_t part, uint64_t offset, const uint8_t *src, uint6
 	}
 	per = ufs_buffer_size / nbs;
 	lck_mtx_lock(&ufs_write_mtx);
+	if (ufs_own) {
+		/* own mode (ufs_native_data=1): the data volume through this kernel's driver, inside the partition's window */
+		error = ufs_own_write(part, offset, src, len);
+		lck_mtx_unlock(&ufs_write_mtx);
+		return error;
+	}
 	if (ufs_nufs_on) {
 		/* ufs=3: through this kernel's own driver, into USERDATA's window only; never the loader's way as well */
 		error = ufs_nufs_write(part, offset, src, len);
@@ -844,8 +851,8 @@ ufs_data_flush(void)
 {
 	int error;
 
-	if (ufs_nufs_on) {
-		/* ufs=3: the device's cache, through this kernel's own driver (SYNCHRONIZE CACHE to USERDATA's unit) */
+	if (ufs_nufs_on || ufs_own) {
+		/* ufs=3 or own mode: the device's cache, through this kernel's own driver (SYNCHRONIZE CACHE to USERDATA's unit) */
 		lck_mtx_lock(&ufs_write_mtx);
 		error = ufshc_sync();
 		lck_mtx_unlock(&ufs_write_mtx);
@@ -2363,6 +2370,21 @@ ufs_own_init(uint32_t mode)
 			printf("ufs: own: /dev/rufs_%s takes writes (whole blocks, LUN %u blocks %llu..%llu); everything else of the "
 			    "storage is read only\n", wname, ufs_lun[part], ufs_page->part[part].start_lba,
 			    ufs_page->part[part].start_lba + ufs_page->part[part].blocks - 1);
+			/*
+			 * ufs_native_data=1: that partition, all of it, is also the data volume's block device,
+			 * /dev/ufs_NAME_data (init: var_hfs=ufs_NAME_data), its writes through ufs_own_write and
+			 * the device's cache flushed when HFS Plus's journal asks (the Galaxy A50: CACHE)
+			 */
+			if (PE_parse_boot_argn("ufs_native_data", &test, sizeof(test)) && test != 0) {
+				ufs_write_part = (int)part;
+				ufs_write_first = 0;
+				if (devfs_make_node(makedev(ufs_bmajor, UFS_DATA_MINOR), DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640,
+				    "ufs_%s_data", wname) != NULL) {
+					printf("ufs: own: /dev/ufs_%s_data: the data volume's block device, %llu MB, flushed when the "
+					    "file system asks\n", wname, ufs_data_bytes() >> 20);
+				}
+				test = 0;
+			}
 		}
 	}
 	/* ufs_native_test=1: own mode's test at start: the refusals, and writes put back (2: one block left written) */

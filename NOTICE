@@ -17,3 +17,11 @@ device identity locally without publishing it.
 Release BOOT prefixes contain the hardware support/firmware already required
 by the tested Scion device image. Preserve the device/firmware and UEFI
 attribution and qualifications in core/NOTICE and SOURCES.md.
+
+Galaxy A50 (Exynos 9610) port
+
+The Galaxy A50 work (core/devices/a50, the Exynos 9610 parts of core/drivers and
+core/xnu/patches/1520-a50-exynos9610.patch, core/tools/a50-fvp.py) is by nespaces,
+built on the Galaxy S9+ publication by danstronics and on HakiOS/Scion-Project.
+It includes no Samsung firmware and no Apple software: the builder supplies both
+from their own phone and IPSW.

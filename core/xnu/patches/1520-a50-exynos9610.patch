@@ -1,0 +1,455 @@
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -329,6 +329,7 @@
+  * to 10 (the phone, 15 October; fb_threads=1 is how it was).
+  */
+ static TUNABLE(uint32_t, gThreads, "fb_threads", 3);
++static TUNABLE(uint32_t, gRowBuffer, "fb_rowbuf", 1);
+ /*
+  * Boot-arg fb_tcoal=1: the kernel's timer coalescing left on. By default this driver turns it off when it starts
+  * (mach_timer_coalescing_enabled, the switch of sysctl kern.timer_coalescing_enabled). CoreAnimation draws a frame when a
+@@ -1244,6 +1245,12 @@
+ 	int32_t px0 = job->px0, py0 = job->py0, px1 = job->px1, py1 = job->py1, cx0 = job->cx0, cx1 = job->cx1;
+ 	bool filter = job->filter;
+ 	uint32_t dx0 = ~0u, dy0 = ~0u, dx1 = 0, dy1 = 0;        /* what this share changed */
++	/*
++	 * A row is made in ordinary (cached) memory and then copied to the panel's whole: on the Galaxy A50 the panel's
++	 * memory takes a 32-bit store at a time as a transaction of its own (a frame of 2.5 million of them: 41 ms on three
++	 * A73s), and a row copied in one piece goes as bursts (10 MB in 2.5 ms; fb_bench, 8 November). fb_rowbuf=0: as before.
++	 */
++	uint32_t * staged = gRowBuffer && !fDiff ? (uint32_t *) IOMallocData((size_t) fPanelWidth * 4) : NULL;
+ 
+ 	for (int32_t y = y0; y < y1; y++) {
+ 		const uint32_t * from;
+@@ -1353,7 +1360,7 @@
+ 		if (filter) {
+ 			const uint32_t * __restrict column = fColumn + cx0;
+ 			const uint16_t * __restrict weights = fColumnWeight + cx0;
+-			uint32_t * __restrict out = to + cx0;
++			uint32_t * __restrict out = (staged != NULL ? staged : to) + cx0;
+ 
+ 			for (uint32_t i = 0, n = (uint32_t) (cx1 - cx0); i < n; i++) {
+ 				uint32_t c = column[i], w = weights[i], a = from[c];
+@@ -1361,10 +1368,18 @@
+ 				out[i] = w == 0 || a == from[c + 1] ? a : blend(a, from[c + 1], w);
+ 			}
+ 		} else {
++			uint32_t * __restrict out = staged != NULL ? staged : to;
++
+ 			for (int32_t x = cx0; x < cx1; x++) {
+-				to[x] = from[fColumn[x]];
++				out[x] = from[fColumn[x]];
+ 			}
+ 		}
++		if (staged != NULL) {
++			memcpy(to + cx0, staged + cx0, (size_t) (cx1 - cx0) * 4);
++		}
++	}
++	if (staged != NULL) {
++		IOFreeData(staged, (size_t) fPanelWidth * 4);
+ 	}
+ 	if (dx0 <= dx1) {
+ 		damage(dx0, dy0, dx1, dy1);
+@@ -1985,6 +2000,58 @@
+ 	unsigned i, first, own;
+ 	bool carve;
+ 
++	/* (read here too: without fb_flip/fb_dpp the end of this function, where they were read, is never reached) */
++	(void) PE_parse_boot_argn("fb_rt", &gRenderRT, sizeof(gRenderRT));
++	(void) PE_parse_boot_argn("fb_cpu", &gRenderCpu, sizeof(gRenderCpu));
++	(void) PE_parse_boot_argn("fb_swapwait", &gSwapWait, sizeof(gSwapWait));
++	(void) PE_parse_boot_argn("fb_rt_us", &gRenderRTMicros, sizeof(gRenderRTMicros));
++	{
++		/* fb_bench=1: the processor's own speed (a chain of dependent adds: one a cycle) and its memories' */
++		uint32_t bench = 0;
++
++		if (PE_parse_boot_argn("fb_bench", &bench, sizeof(bench)) && bench != 0 && fBootBase != NULL) {
++			size_t bytes = (size_t) fRowBytes * fPanelHeight;
++			IOBufferMemoryDescriptor * kb = IOBufferMemoryDescriptor::withCapacity(bytes, kIODirectionInOut);
++			uint8_t * k = kb != NULL ? (uint8_t *) kb->getBytesNoCopy() : NULL;
++			uint64_t t[7], sum = 0, ns[6], x = 1;
++
++			t[0] = mach_absolute_time();
++			for (uint32_t i = 0; i < 100000000; i++) {
++				__asm__ volatile ("add %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1" : "+r" (x));
++			}
++			t[1] = mach_absolute_time();
++			absolutetime_to_nanoseconds(t[1] - t[0], &ns[0]);
++			scanSay("fb_bench: on cpu %d: 400M dependent adds in %llu us: about %llu MHz (%llu)\n", cpu_number(),
++			    ns[0] / 1000, ns[0] ? 400000000ULL * 1000 / ns[0] : 0, x);
++			if (k == NULL) {
++				scanSay("fb_bench: no %zu bytes of kernel memory\n", bytes);
++			} else {
++				memset(k, 1, bytes);
++				t[1] = mach_absolute_time();
++				bzero(fBootBase, bytes);
++				t[2] = mach_absolute_time();
++				for (size_t o = 0; o < bytes; o += 8) {
++					sum += *(volatile uint64_t *) (fBootBase + o);
++				}
++				t[3] = mach_absolute_time();
++				bzero(k, bytes);
++				t[4] = mach_absolute_time();
++				for (size_t o = 0; o < bytes; o += 8) {
++					sum += *(volatile uint64_t *) (k + o);
++				}
++				t[5] = mach_absolute_time();
++				memcpy(fBootBase, k, bytes);
++				t[6] = mach_absolute_time();
++				for (int i = 1; i < 6; i++) {
++					absolutetime_to_nanoseconds(t[i + 1] - t[i], &ns[i]);
++				}
++				scanSay("fb_bench: %zu bytes: framebuffer written %llu us, read %llu us; kernel memory written %llu us, "
++				    "read %llu us; kernel memory to the framebuffer %llu us (%llu)\n", bytes, ns[1] / 1000, ns[2] / 1000,
++				    ns[3] / 1000, ns[4] / 1000, ns[5] / 1000, sum);
++			}
++			OSSafeReleaseNULL(kb);
++		}
++	}
+ 	if (want == 0 && !gFpsLog) {
+ 		return;
+ 	}
+diff --git a/osfmk/arm64/loader_return.c b/osfmk/arm64/loader_return.c
+--- a/osfmk/arm64/loader_return.c
++++ b/osfmk/arm64/loader_return.c
+@@ -195,6 +195,30 @@
+ #define ESSLOG_MAGIC    0x0000000a6c6c7546ULL
+ static volatile uint8_t *esslog_hdr, *esslog_buf;
+ static uint32_t esslog_at;
++/*
++ * esslog=2 (Galaxy A50): the same into the pmsg zone of TWRP's ramoops (0xF9E90000, 512 KB, ecc 0: a header
++ * { "DBGC", start, size } then the ring, fs/pstore/ram_core.c), so that /sys/fs/pstore/pmsg-ramoops-0 has the log of
++ * a run the phone was reset out of (the loader writes the same zone only on its way back).
++ */
++#define PMSGLOG_PA      0xF9E90000ULL
++#define PMSGLOG_SIZE    0x80000u
++#define PMSGLOG_SIG     0x43474244u
++static volatile uint32_t *pmsglog_hdr;
++static volatile uint8_t *pmsglog_buf;
++static uint32_t pmsglog_at, pmsglog_size;
++static void
++pmsglog_put(char c)
++{
++	pmsglog_buf[pmsglog_at++] = (uint8_t)c;
++	if (pmsglog_size < PMSGLOG_SIZE - 12) {
++		pmsglog_size++;
++	}
++	if (pmsglog_at >= PMSGLOG_SIZE - 12) {
++		pmsglog_at = 0;
++	}
++	pmsglog_hdr[1] = pmsglog_at;
++	pmsglog_hdr[2] = pmsglog_size;
++}
+ static void
+ esslog_put(char c)
+ {
+@@ -218,6 +242,9 @@
+ 	if (esslog_buf != NULL) {
+ 		esslog_put(c);
+ 	}
++	if (pmsglog_buf != NULL) {
++		pmsglog_put(c);
++	}
+ 	if (loader_log_linear || loader_log_len < LOADER_LOG_HEAD) {
+ 		if (loader_log_len < LOADER_LOG_SIZE) {
+ 			loader_log[loader_log_len++] = c;
+@@ -928,7 +955,39 @@
+ 	bool locked = false;
+ 	volatile uint8_t *hdr, *buf;
+ 
+-	if (esslog_buf != NULL || !PE_parse_boot_argn("esslog", &on, sizeof(on)) || on == 0) {
++	if (esslog_buf != NULL || pmsglog_buf != NULL || !PE_parse_boot_argn("esslog", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	if (on == 2) {
++		volatile uint8_t *zone = (volatile uint8_t *)ml_io_map(PMSGLOG_PA, PMSGLOG_SIZE);
++
++		if (zone == NULL) {
++			printf("esslog: the pmsg zone could not be mapped\n");
++			return;
++		}
++		daif = __builtin_arm_rsr64("DAIF");
++		__builtin_arm_wsr("DAIFSet", DAIFSC_IRQF | DAIFSC_FIQF);
++		for (uint32_t tries = 0; !locked && tries < 10000000; tries++) {
++			locked = os_atomic_cmpxchg(&loader_log_lock, 0, 1, acquire);
++		}
++		len = loader_log_len < LOADER_LOG_HEAD || loader_log_linear || !loader_log_wrapped ? loader_log_len : LOADER_LOG_HEAD;
++		if (len > PMSGLOG_SIZE - 64) {
++			len = PMSGLOG_SIZE - 64;
++		}
++		for (uint32_t i = 0; i < len; i++) {
++			zone[12 + i] = (uint8_t)loader_log[i];
++		}
++		pmsglog_hdr = (volatile uint32_t *)zone;
++		pmsglog_at = pmsglog_size = len;
++		pmsglog_hdr[1] = pmsglog_at;
++		pmsglog_hdr[2] = pmsglog_size;
++		pmsglog_hdr[0] = PMSGLOG_SIG;
++		pmsglog_buf = zone + 12;
++		if (locked) {
++			os_atomic_store(&loader_log_lock, 0, release);
++		}
++		__builtin_arm_wsr64("DAIF", daif);
++		printf("esslog: the log goes to the pmsg zone too (%u bytes so far): pmsg-ramoops-0 in TWRP after a reset\n", len);
+ 		return;
+ 	}
+ 	hdr = (volatile uint8_t *)ml_io_map(ESSLOG_HDR_PA, 0x1000);
+diff --git a/osfmk/arm64/psci_smp.c b/osfmk/arm64/psci_smp.c
+--- a/osfmk/arm64/psci_smp.c
++++ b/osfmk/arm64/psci_smp.c
+@@ -406,9 +406,154 @@
+ 	return ns / 1000;
+ }
+ 
++/*
++ * HakiOS (Galaxy A50, boot-arg lpm9610=1): the CPU part of Samsung's pmucal_lpm_init for the Exynos 9610, which its
++ * kernel runs (cal_if_init) before smp_init and S-Boot does not: the clusters' L2, CPU and non-CPU power options of the
++ * PMU (0x11860000). Samsung's 4.14 kernel for the A50, drivers/soc/samsung/cal-if/exynos9610/pmucal_system_exynos9610.h,
++ * in its order; only these entries (none of TOP, MEMORY or PS_HOLD). The S9's big cores needed the same kind of thing
++ * (devices/starlte/README.md, "The cores"). Once, before the first CPU_ON; every value said before and after.
++ */
++static void
++psci_smp_lpm9610(void)
++{
++	static bool done;
++	static const struct { uint32_t at, mask, value; const char *name; } seq[] = {
++		{ 0x2608, 1u << 17, 0, "CLUSTER0_L2_OPTION" }, { 0x2628, 1u << 17, 0, "CLUSTER1_L2_OPTION" },
++		{ 0x2608, 1u << 16, 1u << 16, "CLUSTER0_L2_OPTION" }, { 0x2628, 1u << 16, 1u << 16, "CLUSTER1_L2_OPTION" },
++		{ 0x2008, 1u << 12, 0, "CLUSTER0_CPU0_OPTION" }, { 0x2088, 1u << 12, 0, "CLUSTER0_CPU1_OPTION" },
++		{ 0x2108, 1u << 12, 0, "CLUSTER0_CPU2_OPTION" }, { 0x2188, 1u << 12, 0, "CLUSTER0_CPU3_OPTION" },
++		{ 0x2208, 1u << 12, 0, "CLUSTER1_CPU0_OPTION" }, { 0x2288, 1u << 12, 0, "CLUSTER1_CPU1_OPTION" },
++		{ 0x2308, 1u << 12, 0, "CLUSTER1_CPU2_OPTION" }, { 0x2388, 1u << 12, 0, "CLUSTER1_CPU3_OPTION" },
++		{ 0x2008, 0x3f, 0x1f, "CLUSTER0_CPU0_OPTION" }, { 0x2088, 0x3f, 0x1f, "CLUSTER0_CPU1_OPTION" },
++		{ 0x2108, 0x3f, 0x1f, "CLUSTER0_CPU2_OPTION" }, { 0x2188, 0x3f, 0x1f, "CLUSTER0_CPU3_OPTION" },
++		{ 0x2208, 0x3f, 0x1f, "CLUSTER1_CPU0_OPTION" }, { 0x2288, 0x3f, 0x1f, "CLUSTER1_CPU1_OPTION" },
++		{ 0x2308, 0x3f, 0x1f, "CLUSTER1_CPU2_OPTION" }, { 0x2388, 0x3f, 0x1f, "CLUSTER1_CPU3_OPTION" },
++		{ 0x2408, 0x3fu << 8, 0x1fu << 8, "CLUSTER0_NONCPU_OPTION" }, { 0x2428, 0x3fu << 8, 0x1fu << 8, "CLUSTER1_NONCPU_OPTION" },
++		{ 0x2008, 1u << 28, 1u << 28, "CLUSTER0_CPU0_OPTION" }, { 0x2088, 1u << 28, 1u << 28, "CLUSTER0_CPU1_OPTION" },
++		{ 0x2108, 1u << 28, 1u << 28, "CLUSTER0_CPU2_OPTION" }, { 0x2188, 1u << 28, 1u << 28, "CLUSTER0_CPU3_OPTION" },
++		{ 0x2208, 1u << 28, 1u << 28, "CLUSTER1_CPU0_OPTION" }, { 0x2288, 1u << 28, 1u << 28, "CLUSTER1_CPU1_OPTION" },
++		{ 0x2308, 1u << 28, 1u << 28, "CLUSTER1_CPU2_OPTION" }, { 0x2388, 1u << 28, 1u << 28, "CLUSTER1_CPU3_OPTION" },
++	};
++	uint32_t on = 0;
++	volatile uint8_t *pmu;
++
++	if (done || !PE_parse_boot_argn("lpm9610", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	done = true;
++	pmu = (volatile uint8_t *)ml_io_map(0x11860000, 0x3000);
++	if (pmu == NULL) {
++		psci_smp_step("psci: lpm9610: the PMU could not be mapped\n");
++		return;
++	}
++	{
++		/* CPUCL0's clock, read only (the port's analysis notes: PLL_CPUCL0 CON0 0x10900140, its mux 0x10901000 bit 0 = 0 the
++		 * PLL, the switch-user mux 0x10900120 bit 4; M [25:16], P [13:8], S [2:0] on 26 MHz) */
++		volatile uint8_t *cmu = (volatile uint8_t *)ml_io_map(0x10900000, 0x2000);
++
++		if (cmu != NULL) {
++			uint32_t con0 = *(volatile uint32_t *)(cmu + 0x140), m = (con0 >> 16) & 0x3ff, p = (con0 >> 8) & 0x3f, sdiv = con0 & 7;
++			uint64_t khz = p != 0 ? 26000ULL * m / ((uint64_t)p << sdiv) : 0;
++
++			psci_smp_step("psci: lpm9610: PLL_CPUCL0 CON0 %#x (M %u P %u S %u: %llu kHz, %s, %s, bit4 %u), MUX_CPUCL0 %#x, "
++			    "SWITCH_USER %#x, DIV_CPU %#x\n", con0, m, p, sdiv, khz, (con0 >> 31) & 1 ? "enabled" : "NOT enabled",
++			    (con0 >> 29) & 1 ? "stable" : "not stable", (con0 >> 4) & 1, *(volatile uint32_t *)(cmu + 0x1000),
++			    *(volatile uint32_t *)(cmu + 0x120), *(volatile uint32_t *)(cmu + 0x1810));
++		}
++	}
++	if (on >= 3) {
++		/* PS_HOLD_CONTROL (+0x330C) bits 31 and 8, first, as pmucal_lpm_init sets them (the port's analysis notes) */
++		volatile uint32_t *ps = (volatile uint32_t *)(pmu + 0x330C);
++		uint32_t was;
++
++		pmu = (volatile uint8_t *)ml_io_map(0x11860000, 0x4000);
++		ps = (volatile uint32_t *)(pmu + 0x330C);
++		was = *ps;
++		*ps = was | (1u << 31) | (1u << 8);
++		__builtin_arm_dsb(DSB_SY);
++		psci_smp_step("psci: lpm9610: PS_HOLD_CONTROL +0x330c: %#x -> %#x\n", was, *ps);
++	}
++	psci_smp_step("psci: lpm9610: CPU2 CONFIGURATION %#x STATUS %#x, CPU3 %#x %#x, CLUSTER1 CPU0 %#x %#x before\n",
++	    *(volatile uint32_t *)(pmu + 0x2100), *(volatile uint32_t *)(pmu + 0x2104), *(volatile uint32_t *)(pmu + 0x2180),
++	    *(volatile uint32_t *)(pmu + 0x2184), *(volatile uint32_t *)(pmu + 0x2200), *(volatile uint32_t *)(pmu + 0x2204));
++	for (unsigned i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
++		volatile uint32_t *r = (volatile uint32_t *)(pmu + seq[i].at);
++		uint32_t was = *r;
++
++		if (on >= 2) {
++			*r = (was & ~seq[i].mask) | seq[i].value;
++			__builtin_arm_dsb(DSB_SY);
++		}
++		psci_smp_step("psci: lpm9610: %s +%#x: %#x -> %#x%s\n", seq[i].name, seq[i].at, was, *r,
++		    on >= 2 ? "" : " (lpm9610=1: read only)");
++	}
++}
++
++/*
++ * HakiOS (Galaxy A50, boot-arg psci_low=PA): CPU_ON is given PA, below 4 GB, instead of the kernel's reset vector
++ * (in the bank from 0x880000000), and there a trampoline -- "TRAMP" into the console zone of TWRP's ramoops
++ * (0xF9D90000, as start.s's own note), then a branch to the reset vector. Whether Samsung's EL3 on the 9610 keeps
++ * only 32 bits of the entry (the port's analysis notes, step D). The page is outside XNU's RAM; written through a device
++ * mapping, so in memory for a core whose MMU and caches are off.
++ */
++__asm__(
++	"	.text\n"
++	"	.balign 8\n"
++	"	.globl _hk_tramp\n"
++	"_hk_tramp:\n"
++	"	movz	x9, #0xF9D9, lsl #16\n"
++	"	movz	w10, #0x5254\n"
++	"	movk	w10, #0x4d41, lsl #16\n"
++	"	str	w10, [x9, #12]\n"
++	"	movz	w10, #0x0a50\n"
++	"	strh	w10, [x9, #16]\n"
++	"	mov	w10, #6\n"
++	"	str	w10, [x9, #4]\n"
++	"	str	w10, [x9, #8]\n"
++	"	movz	w10, #0x4244\n"
++	"	movk	w10, #0x4347, lsl #16\n"
++	"	str	w10, [x9]\n"
++	"	dsb	sy\n"
++	"	ldr	x16, 1f\n"
++	"	br	x16\n"
++	"	.balign 8\n"
++	"1:	.quad 0\n"
++	"	.globl _hk_tramp_end\n"
++	"_hk_tramp_end:\n");
++extern const char hk_tramp[], hk_tramp_end[];
++
++static uint64_t
++psci_smp_low_entry(uint64_t entry)
++{
++	uint64_t low = 0;
++	volatile uint8_t *page;
++	size_t n = (size_t)(hk_tramp_end - hk_tramp);
++
++	if (!PE_parse_boot_argn("psci_low", &low, sizeof(low)) || low == 0 || (low & 0xfff) || low >= (1ULL << 32)) {
++		return entry;
++	}
++	page = (volatile uint8_t *)ml_io_map((vm_offset_t)low, PAGE_SIZE);
++	if (page == NULL) {
++		psci_smp_step("psci: psci_low=%#llx could not be mapped: the entry stays %#llx\n", low, entry);
++		return entry;
++	}
++	for (size_t i = 0; i < n - 8; i++) {
++		page[i] = (uint8_t)hk_tramp[i];
++	}
++	*(volatile uint64_t *)(page + n - 8) = entry;
++	__builtin_arm_dsb(DSB_SY);
++	psci_smp_step("psci: psci_low: a %zu-byte trampoline at %#llx to %#llx; CPU_ON is given %#llx\n", n, low, entry, low);
++	return low;
++}
++
+ kern_return_t
+ psci_smp_start_cpu(int cpu)
+ {
++	extern void hakios_esslog_start(void);
++	/* (esslog=) the log kept across a reset from here: a core whose start resets the phone is caught */
++	hakios_esslog_start();
++	psci_smp_lpm9610();
++
+ 	cpu_data_t *cdp = cpu_datap(cpu);
+ 	uint32_t phys_id = cdp->cpu_phys_id, stage;
+ 	uint64_t entry = ml_static_vtop((vm_offset_t)&LowResetVectorBase);
+@@ -455,7 +600,7 @@
+ 		}
+ 	}
+ 	psci_smp_diag_before(cpu, phys_id);
+-	status = psci_call(PSCI_CPU_ON, phys_id, entry, 0);
++	status = psci_call(PSCI_CPU_ON, phys_id, psci_smp_low_entry(entry), 0);
+ 	if (hakios_m3_park) {
+ 		volatile uint64_t *slot = (volatile uint64_t *)ml_io_map(0xFDA10000 + 32 * ((phys_id >> 8) & 0xf), 0x1000);
+ 
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -122,11 +122,53 @@
+ 	.align	7
+ 	b		.
+ 
++
++/*
++ * HakiOS (Galaxy A50 bring-up, boot-arg-free): a new core's way through reset_vector, MMU off, into the console
++ * zone of TWRP's ramoops (0xF9D90000: { "DBGC", start, size }, then text), which survives a reset and shows as
++ * /sys/fs/pstore/console-ramoops-0: "HAKIOS: new core MPIDR x, EL y, step A" with its MPIDR's Aff0, its EL and the last step reached.
++ */
++#define HK_NOTE_PA_HI   0xF9D9
++#define HK_NOTE_LEN     39
++#define HK_NOTE_MPIDR   (35)
++#define HK_NOTE_EL      (41)
++#define HK_NOTE_STEP    (49)
++.macro HK_NOTE_STEP_SET
++	movz	x11, #HK_NOTE_PA_HI, lsl #16
++	mov		w10, #$0
++	strb	w10, [x11, #HK_NOTE_STEP]
++	dsb		sy
++.endmacro
+ 	.align	7
+ 	.globl EXT(reset_vector)
+ LEXT(reset_vector)
+ 	// Preserve x0 for start_first_cpu, if called
+ #if defined(GENERIC_PSCI_SMP)
++	movz	x11, #HK_NOTE_PA_HI, lsl #16
++	adrp	x12, Lhk_note@page
++	add		x12, x12, Lhk_note@pageoff
++	add		x13, x11, #12
++	mov		x9, #HK_NOTE_LEN
++Lhk_note_copy:
++	ldrb	w10, [x12], #1
++	strb	w10, [x13], #1
++	subs	x9, x9, #1
++	b.ne	Lhk_note_copy
++	mrs		x10, MPIDR_EL1
++	and		x10, x10, #0xf
++	add		w10, w10, #0x30
++	strb	w10, [x11, #HK_NOTE_MPIDR]
++	mrs		x10, CurrentEL
++	ubfx	x10, x10, #2, #2
++	add		w10, w10, #0x30
++	strb	w10, [x11, #HK_NOTE_EL]
++	mov		w10, #HK_NOTE_LEN
++	str		w10, [x11, #4]
++	str		w10, [x11, #8]
++	movz	w10, #0x4244
++	movk	w10, #0x4347, lsl #16
++	str		w10, [x11]
++	dsb		sy
+ 	/*
+ 	 * A core that the firmware has just started for us (PSCI CPU_ON, see
+ 	 * psci_smp.c) has no vectors at all, and under a third-party hypervisor
+@@ -139,13 +181,16 @@
+ 	add		x0, x0, EXT(LowSecondaryExceptionVectorBase)@pageoff
+ 	msr		VBAR_EL1, x0
+ 	isb
++	HK_NOTE_STEP_SET 0x42
+ 	// The MMU and the caches are off, says PSCI; of the rest of SCTLR it
+ 	// says nothing. Only the bits that must be set, until common_start.
+ 	MOV64	x0, 0x30D00800
+ 	msr		SCTLR_EL1, x0
+ 	isb
++	HK_NOTE_STEP_SET 0x43
+ 	// Unlock the core for debugging
+ 	msr		OSLAR_EL1, xzr
++	HK_NOTE_STEP_SET 0x44
+ #else /* defined(GENERIC_PSCI_SMP) */
+ 	// Unlock the core for debugging
+ 	msr		OSLAR_EL1, xzr
+@@ -178,6 +223,7 @@
+ 	mrs		x3, ID_AA64PFR0_EL1
+ 	str		x3, [x2, #24]
+ 	dsb		sy
++	HK_NOTE_STEP_SET 0x45
+ 	// a big core (MT clear, Affinity1 1) parks here when asked (boot-arg m3_ids=1): its IDs read by the boot core
+ 	adrp	x2, EXT(hakios_m3_park)@page
+ 	add		x2, x2, EXT(hakios_m3_park)@pageoff
+@@ -1151,3 +1197,8 @@
+ //#include	"globals_asm.h"
+ 
+ /* vim: set ts=4: */
++
++	.text
++	.align 3
++Lhk_note:
++	.ascii "HAKIOS: new core MPIDR x, EL y, step A\n"

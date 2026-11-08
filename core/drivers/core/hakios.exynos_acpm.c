@@ -45,6 +45,7 @@
  * answers, the timeout). All GPL: read for these facts, not one line copied.
  */
 #include <pexpert/pexpert.h>
+#include <stdarg.h>
 #include <kern/clock.h>
 #include <kern/locks.h>
 #include <libkern/libkern.h>
@@ -52,24 +53,34 @@
 #include <mach/mach_types.h>
 #include <sys/errno.h>
 #include <sys/hakios.exynos_acpm.h>
+#include "hakios.exynos9610_fvp.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void delay(int usec);
 
-#define MBOX_PA         0x14100000UL
+/*
+ * The SoC's: the Exynos 9810's (the S9) unless boot-arg acpm_soc=9610 (the Galaxy A50: mailbox 0x11900000, SRAM 0x15000
+ * from the same 0x02039000, initdata +0x6F00, the DVFS plugin's fvmap at its base + 0x6000; the port's analysis notes, from
+ * Samsung's 4.14 kernel for it and exynos9610.dts). Boot-arg acpm9610=1: passive -- the table read, no queue drained,
+ * no interrupt cleared, no request sent.
+ */
+static unsigned long acpm_mbox_pa = 0x14100000UL;
+static uint32_t acpm_sram_size = 0x30000, acpm_initdata = 0x7F00, acpm_build = 0x6C, acpm_fvmap = 0x6700;
+static uint32_t acpm_passive;
+#define MBOX_PA         acpm_mbox_pa
 #define MBOX_INTGR0     0x08
 #define MBOX_INTCR1     0x20
 #define MBOX_INTMR1     0x24
 #define MBOX_INTSR1     0x28
 #define SRAM_PA         0x02039000UL
-#define SRAM_SIZE       0x30000
+#define SRAM_SIZE       acpm_sram_size
 #define SRAM_FIRST      0x3000          /* below: pages that fault; not mapped, never read */
-#define INITDATA        0x7F00
+#define INITDATA        acpm_initdata
 
 #define ID_CHANNELS     0x08
 #define ID_NCHANNELS    0x0C
 #define ID_AP_MAX       0x18
-#define ID_BUILD        0x6C            /* seen on the phone, 1 November: three words more before build_info than the BSP's header has (0x007f0000 0x10 0x40), then "92dbdb1" */
+#define ID_BUILD        acpm_build            /* seen on the phone, 1 November: three words more before build_info than the BSP's header has (0x007f0000 0x10 0x40), then "92dbdb1" */
 
 #define CH_SIZE         0x48
 #define CH_ID           0x00
@@ -206,6 +217,10 @@ acpm_setup(int (*say)(const char *, ...))
 		say("acpm: cannot map the mailbox (%#lx) or the APM's SRAM (%#lx)\n", MBOX_PA, SRAM_PA + SRAM_FIRST);
 		return false;
 	}
+	if (!printable(INITDATA + ID_BUILD, 25) && printable(INITDATA + 0x64, 25)) {
+		say("acpm: the version string at initdata +0x64 (the BSP's header), not +%#x\n", acpm_build);
+		acpm_build = 0x64;
+	}
 	if (!printable(INITDATA + ID_BUILD, 25)) {
 		say("acpm: no firmware's table at SRAM +%#x (its version string is not text): not used\n", INITDATA);
 		for (uint32_t o = 0; o < 0x80; o += 0x20) {
@@ -259,7 +274,7 @@ acpm_setup(int (*say)(const char *, ...))
 		}
 		c = &channels[id];
 		*c = n;
-		if (!c->buffer) {
+		if (!c->buffer && !acpm_passive) {
 			drain(c, id);   /* answers nobody read (a kernel before this one, or none): out of the way */
 		}
 	}
@@ -382,8 +397,8 @@ hakios_acpm_request(uint32_t id, uint32_t cmd[4])
 {
 	int error;
 
-	if (!acpm_ready || id >= CHANNELS_MOST || !channels[id].usable) {
-		return ENXIO;
+	if (!acpm_ready || id >= CHANNELS_MOST || !channels[id].usable || acpm_passive) {
+		return ENXIO;           /* (acpm9610=1: passive, nothing sent) */
 	}
 	lck_mtx_lock(&acpm_lock);
 	error = channels[id].buffer ? request_buffer(&channels[id], id, cmd) : request_queue(&channels[id], id, cmd);
@@ -468,7 +483,7 @@ hakios_acpm_dvfs_set(uint32_t index, uint32_t khz)
 #define PL_FWSIZE       0x24
 #define PL_STAYS        0x28
 #define PL_NAME         0x2C
-#define FVMAP_OFFSET    0x6700          /* the device tree's acpm { fvmap_offset = <26368>; } */
+#define FVMAP_OFFSET    acpm_fvmap          /* the device tree's acpm { fvmap_offset = <26368>; } */
 #define FV_HEADER       24
 #define FV_NUM_LV       0x01
 #define FV_O_RATEVOLT   0x14
@@ -579,6 +594,181 @@ hakios_acpm_stop(void)
  */
 extern void loader_log_line(const char *line);
 void hakios_exynos_dvfs_start(void);
+
+/* printf, and the loader's log too (the passive probe's lines are what the run is for) */
+static int dvfs_say(const char *format, ...) __printflike(1, 2);
+static int
+dvfs_say(const char *format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	loader_log_line(line);
+	return printf("%s", line);
+}
+
+/*
+ * acpm9610=4 (the Galaxy A50): the APM's plugins said; then, if the "fvp" plugin (id 2, the clock DVFS channel's
+ * go-between) is not attached, its code (hakios.exynos9610_fvp.h) copied into its slot in the SRAM and attached, as
+ * Samsung's kernel does at boot (acpm.c plugins_init: firmware_load's memcpy to SRAM + base, then handle_dynamic_plugin:
+ * cmd[0] = 1 << 25 | id << 26 on the acpm node's channel, 4), and the three domains' rates asked again. Only when its
+ * descriptor is as expected: id 2, not attached, base 0x9000 (the binary's link address), a slot of at least its size
+ * inside the SRAM; the copy read back byte for byte before the attach. No descriptor field is written here; no rate is
+ * set. the port's analysis notes.
+ */
+#define FVP_ID          2
+#define FVP_BASE        0x9000
+#define ACPM_ATTACH     (1u << 25)
+#define ACPM_ID_SHIFT   26
+
+/* a queue channel's four indexes, said: requests (APM's rear = taken, our front = put) and answers */
+static void
+fvp_queues(const char *when)
+{
+	static const uint32_t ids[] = { HAKIOS_ACPM_CH_DVFS, HAKIOS_ACPM_CH_ACPM, HAKIOS_ACPM_CH_PMIC };
+
+	for (uint32_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
+		struct channel *c = &channels[ids[i]];
+
+		if (c->usable && !c->buffer) {
+			dvfs_say("acpm: fvp: %s: channel %u: requests taken %u / put %u, answers read %u / written %u (of %u); "
+			    "INTSR1 %#x, INTMR1 %#x\n", when, ids[i], srd(c->in_rear), srd(c->in_front), srd(c->out_rear),
+			    srd(c->out_front), c->len, rd(mbox, MBOX_INTSR1), rd(mbox, MBOX_INTMR1));
+		}
+	}
+	/* the mailbox, both sides, read only: 0x08 INTGR0 .. 0x18 INTMSR0 (the APM's), 0x1C INTGR1 .. 0x2C INTMSR1 (ours) */
+	dvfs_say("acpm: fvp: %s: mailbox +0x00..+0x2c: %#x %#x | GR0 %#x CR0 %#x MR0 %#x SR0 %#x MSR0 %#x | GR1 %#x CR1 %#x "
+	    "MR1 %#x SR1 %#x MSR1 %#x\n", when, rd(mbox, 0x00), rd(mbox, 0x04), rd(mbox, 0x08), rd(mbox, 0x0C), rd(mbox, 0x10),
+	    rd(mbox, 0x14), rd(mbox, 0x18), rd(mbox, 0x1C), rd(mbox, 0x20), rd(mbox, 0x24), rd(mbox, 0x28), rd(mbox, 0x2C));
+}
+
+/*
+ * acpm9610=5 (the port's analysis notes, tests 1-3): the APM framework's own state, read from its SRAM (APM addresses are
+ * SRAM offsets): its log ring (rear +0x7708, front +0x770C, 252 records of 16 bytes from +0x7710: header
+ * id[31:28] level[27] time[26:22] count[15:0], 8 characters, a value), intr_to_skip (initdata +0x5C = +0x6F5C), the
+ * interrupt table's pointer (+0x61AC) and the mailbox entry's is_disabled byte, the credits (+0x61B4, 8 words).
+ */
+#define APM_LOG_REAR    0x7708
+#define APM_LOG_FRONT   0x770C
+#define APM_LOG_DATA    0x7710
+#define APM_LOG_N       252
+static void
+apm_diag(const char *when, uint32_t last)
+{
+	uint32_t rear = srd(APM_LOG_REAR), front = srd(APM_LOG_FRONT), vec = srd(0x61AC);
+
+	dvfs_say("acpm: apm: %s: intr_to_skip %#x, intr table %#x (mailbox entry: field %#x handler %#x disabled %u), "
+	    "credits %u %u %u %u %u %u %u %u, log rear %u front %u\n", when, srd(0x6F5C), vec,
+	    sram_ok(vec + 0x10, 0x10) ? srd(vec + 0x10) : 0, sram_ok(vec + 0x10, 0x10) ? srd(vec + 0x14) : 0,
+	    sram_ok(vec + 0x10, 0x10) ? srd8(vec + 0x1C) : 0xff, srd(0x61B4), srd(0x61B8), srd(0x61BC), srd(0x61C0),
+	    srd(0x61C4), srd(0x61C8), srd(0x61CC), srd(0x61D0), rear, front);
+	fvp_queues(when);
+	if (last == 0 || rear >= APM_LOG_N) {
+		return;
+	}
+	/* the last `last` records before rear (the newest), oldest first */
+	for (uint32_t k = last; k > 0; k--) {
+		uint32_t i = (rear + APM_LOG_N - k) % APM_LOG_N, r = APM_LOG_DATA + 16 * i;
+		uint32_t h = srd(r), a = srd(r + 4), b = srd(r + 8);
+		char str[9];
+
+		if (h == 0 && a == 0 && b == 0) {
+			continue;
+		}
+		for (int c = 0; c < 4; c++) {
+			char x = (char)(a >> (8 * c)), y = (char)(b >> (8 * c));
+			str[c] = (x >= 32 && x < 127) ? x : (x == 0 ? ' ' : '.');
+			str[4 + c] = (y >= 32 && y < 127) ? y : (y == 0 ? ' ' : '.');
+		}
+		str[8] = 0;
+		dvfs_say("acpm: apm log [%3u] id %u lvl %u t %2u n %5u %s %#x\n", i, h >> 28, h >> 27 & 1, h >> 22 & 31,
+		    h & 0xffff, str, srd(r + 12));
+	}
+}
+
+static void
+hakios_acpm_fvp9610(uint32_t got[3], int got_e[3], const char *const names[3])
+{
+	uint32_t plugins = srd(INITDATA + ID_PLUGINS), count = srd(INITDATA + ID_NPLUGINS), fvp = 0, found = 0;
+
+	if (count == 0 || count > 32 || !sram_ok(plugins, count * PL_SIZE)) {
+		dvfs_say("acpm: fvp: the plugins' table (+%#x, %u) is not where it may be read\n", plugins, count);
+		return;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		uint32_t p = plugins + i * PL_SIZE, at_name = srd(p + PL_NAME);
+		char name[32] = "?";
+
+		if (at_name != 0 && sram_ok(at_name & ~3u, sizeof(name) + 4) && printable(at_name, sizeof(name) - 1)) {
+			copy_string(at_name, name, sizeof(name));
+		}
+		dvfs_say("acpm: plugin %u: id %u, base %#x, ops %#x/%#x, attached %u, size %#x, stays %u, \"%s\"\n", i,
+		    srd(p), srd(p + PL_BASE), srd(p + 0x08), srd(p + 0x0C), srd8(p + PL_ATTACHED), srd(p + PL_FWSIZE),
+		    srd8(p + PL_STAYS), name);
+		if (srd(p) == FVP_ID) {
+			fvp = p;
+			found++;
+		}
+	}
+	if (found != 1) {
+		dvfs_say("acpm: fvp: %u descriptors with id %u: nothing done\n", found, FVP_ID);
+		return;
+	}
+	{
+		uint32_t base = srd(fvp + PL_BASE) & ~1u, size = srd(fvp + PL_FWSIZE), attached = srd8(fvp + PL_ATTACHED);
+		uint32_t cmd[4] = { ACPM_ATTACH | (FVP_ID << ACPM_ID_SHIFT), 0, 0, 0 };
+		uint32_t diff = 0;
+		int e;
+
+		if (HAKIOS_FVP_9610_SIZE == 0) {
+			/* the repository's placeholder: tools/a50-fvp.py makes the real header from the phone's own stock BOOT */
+			dvfs_say("acpm: fvp: no plugin built in (hakios.exynos9610_fvp.h is the placeholder: tools/a50-fvp.py): "
+			    "nothing done\n");
+			return;
+		} else if (attached) {
+			dvfs_say("acpm: fvp: attached already: not loaded again\n");
+		} else if (base != FVP_BASE || size < HAKIOS_FVP_9610_SIZE || !sram_ok(base, HAKIOS_FVP_9610_SIZE)) {
+			dvfs_say("acpm: fvp: base %#x size %#x: not the slot expected (base %#x, at least %#x, inside the readable "
+			    "SRAM): nothing done\n", base, size, FVP_BASE, HAKIOS_FVP_9610_SIZE);
+			return;
+		} else {
+			for (uint32_t o = 0; o < HAKIOS_FVP_9610_SIZE; o += 4) {
+				swr(base + o, (uint32_t)hakios_fvp_9610[o] | (uint32_t)hakios_fvp_9610[o + 1] << 8 |
+				    (uint32_t)hakios_fvp_9610[o + 2] << 16 | (uint32_t)hakios_fvp_9610[o + 3] << 24);
+			}
+			__builtin_arm_dsb(0xf);     /* DSB SY */
+			for (uint32_t o = 0; o < HAKIOS_FVP_9610_SIZE; o += 4) {
+				uint32_t w = (uint32_t)hakios_fvp_9610[o] | (uint32_t)hakios_fvp_9610[o + 1] << 8 |
+				    (uint32_t)hakios_fvp_9610[o + 2] << 16 | (uint32_t)hakios_fvp_9610[o + 3] << 24;
+
+				diff += srd(base + o) != w;
+			}
+			dvfs_say("acpm: fvp: %u bytes copied to SRAM +%#x, %u words differ on reading back\n", HAKIOS_FVP_9610_SIZE,
+			    base, diff);
+			if (diff != 0) {
+				return;
+			}
+			fvp_queues("before the attach");
+			e = hakios_acpm_request(HAKIOS_ACPM_CH_ACPM, cmd);
+			fvp_queues("after the attach");
+			dvfs_say("acpm: fvp: attach (cmd[0] %#x on channel %u): %d, answer %#x %#x; the descriptor now: attached %u, "
+			    "ops %#x/%#x\n", ACPM_ATTACH | (FVP_ID << ACPM_ID_SHIFT), HAKIOS_ACPM_CH_ACPM, e, cmd[0], cmd[1],
+			    srd8(fvp + PL_ATTACHED), srd(fvp + 0x08), srd(fvp + 0x0C));
+			if (e != 0) {
+				return;
+			}
+		}
+		for (uint32_t d = 0; d < 3; d++) {
+			uint32_t khz = 0;
+
+			e = hakios_acpm_dvfs_get(2 + d, &khz);
+			dvfs_say("acpm: fvp: GET %s: %u kHz (%d; before the attach %u kHz, %d)\n", names[d], khz, e, got[d], got_e[d]);
+		}
+	}
+}
 void
 hakios_exynos_dvfs_start(void)
 {
@@ -586,6 +776,148 @@ hakios_exynos_dvfs_start(void)
 		{ "cpufreq_lit", "the A55s (cpucl0)", 2 }, { "cpufreq_big", "the M3s (cpucl1)", 3 },
 	};
 
+	{
+		uint32_t soc = 0, khz[32], uv[32], n;
+		static const char *const names[] = { "cpucl0 (the A53s)", "cpucl1 (the A73s)", "g3d (the Mali)" };
+
+		PE_parse_boot_argn("acpm_soc", &soc, sizeof(soc));
+		PE_parse_boot_argn("acpm9610", &acpm_passive, sizeof(acpm_passive));
+		if (soc == 9610) {
+			acpm_mbox_pa = 0x11900000UL;
+			acpm_sram_size = 0x15000;
+			acpm_initdata = 0x6F00;
+			acpm_fvmap = 0x6000;
+		}
+		if (soc == 9610 && acpm_passive >= 2) {
+			/*
+			 * acpm9610=2: IPC GET of each domain's rate and the PMIC's rails read (BUCK2 vdd_cpucl1 0x1A/0x1B, BUCK3
+			 * vdd_cpucl0 0x1C/0x1D, BUCK5 vdd_g3d 0x20/0x21: S2MPU09, s2mpu09-regulator.h); acpm9610=3: then a rate
+			 * set through ACPM for each domain whose GET answered, only to a level of its own fvmap (acpm_cl0=,
+			 * acpm_cl1=, acpm_g3d= kHz; defaults 1534000, 1768000, 572000), and GET again. The APM sets the voltage
+			 * with the rate. the port's analysis notes, steps B and C.
+			 */
+			static const struct { uint8_t ctrl, out; const char *name; } rails[] = {
+				{ 0x1A, 0x1B, "BUCK2 vdd_cpucl1" }, { 0x1C, 0x1D, "BUCK3 vdd_cpucl0" }, { 0x20, 0x21, "BUCK5 vdd_g3d" },
+			};
+			uint32_t want[3] = { 1534000, 1768000, 572000 }, got[3] = { 0 };
+			int got_e[3];
+			uint32_t active = acpm_passive;
+
+			PE_parse_boot_argn("acpm_cl0", &want[0], sizeof(want[0]));
+			PE_parse_boot_argn("acpm_cl1", &want[1], sizeof(want[1]));
+			PE_parse_boot_argn("acpm_g3d", &want[2], sizeof(want[2]));
+			acpm_passive = 0;       /* (requests allowed from here; the queues are drained at setup as usual) */
+			if (!hakios_acpm_init(dvfs_say)) {
+				dvfs_say("acpm: 9610: no ACPM\n");
+				return;
+			}
+			for (uint32_t r = 0; r < 3; r++) {
+				uint8_t ctrl = 0, out = 0;
+				int e1 = hakios_acpm_pmic_read(HAKIOS_ACPM_PMIC_PMIC, rails[r].ctrl, &ctrl);
+				int e2 = hakios_acpm_pmic_read(HAKIOS_ACPM_PMIC_PMIC, rails[r].out, &out);
+
+				dvfs_say("acpm: 9610: %s: CTRL %#x (%d), OUT %#x (%d) = %u uV\n", rails[r].name, ctrl, e1, out, e2,
+				    300000 + 6250 * (uint32_t)out);
+			}
+			/*
+			 * acpm9610=6: channel 0 is the fvp plugin's (the port's analysis notes: owner 1 << 2); until it is attached its
+			 * plugin_ops is 0 and the APM's dispatcher calls through it: a GET first leaves the APM dead (run 41: the
+			 * PMIC unanswered after it). So the plugin loaded and attached first, the GETs after (in the fvp step).
+			 */
+			if (active == 6 || active == 7) {
+				apm_diag("at start", 24);
+				for (uint32_t d = 0; d < 3; d++) {
+					got_e[d] = -1;
+				}
+				hakios_acpm_fvp9610(got, got_e, names);
+				/* every word of a GET's answer: cmd[0]'s low 16 bits are the DVFS plugin's result (the port's analysis notes) */
+				for (uint32_t d = 0; d < 3; d++) {
+					uint32_t cmd[4] = { 2 + d, 0, 1, 0 };
+
+					got_e[d] = hakios_acpm_request(HAKIOS_ACPM_CH_DVFS, cmd);
+					got[d] = cmd[1];
+					dvfs_say("acpm: 9610: GET %s raw: %d, answer %#x %#x %#x %#x (result %#x)\n", names[d], got_e[d],
+					    cmd[0], cmd[1], cmd[2], cmd[3], cmd[0] & 0xffff);
+				}
+				apm_diag("after the attach and the GETs", 32);
+				if (active == 6) {
+					return;
+				}
+			} else for (uint32_t d = 0; d < 3; d++) {
+				got_e[d] = hakios_acpm_dvfs_get(2 + d, &got[d]);
+				dvfs_say("acpm: 9610: GET %s: %u kHz (%d)\n", names[d], got[d], got_e[d]);
+			}
+			if (active == 5) {
+				uint8_t v = 0;
+				int e;
+
+				apm_diag("after the GETs", 64);
+				wr(mbox, 0x0C, 0xFFFFFFFFu);    /* INTCR0 from the AP side */
+				__builtin_arm_dsb(0xf);
+				dvfs_say("acpm: apm: INTCR0 <- 0xffffffff: SR0 now %#x\n", rd(mbox, 0x14));
+				e = hakios_acpm_pmic_read(HAKIOS_ACPM_PMIC_PMIC, 0x21, &v);
+				dvfs_say("acpm: apm: PMIC read (the pump) %#x (%d): SR0 now %#x\n", v, e, rd(mbox, 0x14));
+				apm_diag("after the clear and the pump", 16);
+				for (uint32_t d = 0; d < 3; d++) {
+					got_e[d] = hakios_acpm_dvfs_get(2 + d, &got[d]);
+					dvfs_say("acpm: apm: GET again %s: %u kHz (%d); SR0 %#x\n", names[d], got[d], got_e[d],
+					    rd(mbox, 0x14));
+				}
+				apm_diag("after the second GETs", 16);
+			}
+			if (active == 4 || active == 5) {
+				hakios_acpm_fvp9610(got, got_e, names);
+				if (active == 5) {
+					apm_diag("at the end", 32);
+				}
+				return;
+			}
+			if (active < 3) {
+				return;
+			}
+			for (uint32_t d = 0; d < (active == 7 ? 2u : 3u); d++) {    /* (7: the CPUs only; the Mali is mali_mhz's) */
+				uint32_t after = 0, ok = 0;
+				int e1, e2;
+
+				n = hakios_acpm_dvfs_table(2 + d, khz, uv, 32, dvfs_say);
+				for (uint32_t l = 0; l < n; l++) {
+					ok |= khz[l] == want[d];
+				}
+				if (got_e[d] != 0 || !ok) {
+					dvfs_say("acpm: 9610: %s: not set (GET %d, %u kHz %s its fvmap)\n", names[d], got_e[d], want[d],
+					    ok ? "in" : "NOT IN");
+					continue;
+				}
+				e1 = hakios_acpm_dvfs_set(2 + d, want[d]);
+				e2 = hakios_acpm_dvfs_get(2 + d, &after);
+				dvfs_say("acpm: 9610: SET %s: %u -> asked %u kHz (%d) -> GET %u kHz (%d)\n", names[d], got[d], want[d], e1,
+				    after, e2);
+			}
+			for (uint32_t r = 0; r < 3; r++) {
+				uint8_t out = 0;
+				int e = hakios_acpm_pmic_read(HAKIOS_ACPM_PMIC_PMIC, rails[r].out, &out);
+
+				dvfs_say("acpm: 9610: after: %s OUT %#x (%d) = %u uV\n", rails[r].name, out, e, 300000 + 6250 * (uint32_t)out);
+			}
+			return;
+		}
+		if (soc == 9610 && acpm_passive) {
+			char line[200];
+
+			snprintf(line, sizeof(line), "acpm: 9610, passive (acpm9610=%u): mailbox %#lx, SRAM %#lx + %#x, initdata +%#x\n",
+			    acpm_passive, acpm_mbox_pa, SRAM_PA, acpm_sram_size, acpm_initdata);
+			loader_log_line(line);
+			if (hakios_acpm_init(dvfs_say)) {
+				for (uint32_t d = 0; d < 3; d++) {
+					n = hakios_acpm_dvfs_table(2 + d, khz, uv, 32, dvfs_say);
+					for (uint32_t l = 0; l < n; l++) {
+						dvfs_say("acpm: fvmap: %s level %u: %u kHz, %u uV\n", names[d], l, khz[l], uv[l]);
+					}
+				}
+			}
+			return;         /* passive: no governor, no rate set */
+		}
+	}
 	if (hakios_exynos_cpufreq_gov_start()) {
 		return;
 	}

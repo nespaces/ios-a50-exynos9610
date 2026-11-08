@@ -26,6 +26,11 @@
  * The mapping: the iPhone X, whose user space runs here, has a side button and two volume keys. Power is the
  * side button (HAKIOS_BUTTON_LOCK); Bixby, where the iPhone has nothing, is the home button (HAKIOS_BUTTON_HOME),
  * which is a way home while there is no touch screen.
+ *
+ * exynos_keys=2: the Galaxy A50's (SM-A505FN, Exynos 9610) instead -- its gpio_keys (TWRP's live device tree): all
+ * three on gpa1 of the ALIVE block at 0x11850000 (bank +0x40: gpa0 +0x20, banks 0x20 apart, pinctrl-exynos-arm64.c's
+ * exynos9610_pin_banks0), volume up pin 5, volume down pin 6, power pin 7; no Bixby key (home is the touch screen's
+ * swipe up, as on the iPhone X).
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -57,6 +62,8 @@ say(const char *format, ...)
 }
 
 #define ALIVE_PA        0x14050000UL    /* pinctrl@14050000: the ALIVE GPIO block */
+#define ALIVE_PA_A50    0x11850000UL    /* pinctrl@11850000 on the Exynos 9610 */
+#define BANK_GPA1       0x040
 #define ALIVE_SIZE      0x1000
 #define BANK_GPA0       0x020
 #define BANK_GPA2       0x060
@@ -80,8 +87,15 @@ static struct key {
 	{ "volume-up", BANK_GPA0, 3, HAKIOS_BUTTON_VOLUME_UP },
 	{ "volume-down", BANK_GPA0, 4, HAKIOS_BUTTON_VOLUME_DOWN },
 	{ "bixby", BANK_GPA0, 6, HAKIOS_BUTTON_HOME },
+}, keys_a50[] = {
+	{ "power", BANK_GPA1, 7, HAKIOS_BUTTON_LOCK },
+	{ "volume-up", BANK_GPA1, 5, HAKIOS_BUTTON_VOLUME_UP },
+	{ "volume-down", BANK_GPA1, 6, HAKIOS_BUTTON_VOLUME_DOWN },
 };
-#define NKEYS (sizeof(keys) / sizeof(keys[0]))
+static struct key *keyset = keys;
+static unsigned nkeys = sizeof(keys) / sizeof(keys[0]);
+static unsigned long alive_pa = ALIVE_PA;
+#define NKEYS nkeys
 
 static vm_offset_t alive;
 
@@ -93,19 +107,17 @@ rd(uint32_t off)
 
 /* held: the pin at 0 */
 static bool
-key_held(const struct key *k, uint32_t gpa0, uint32_t gpa2)
+key_held(const struct key *k)
 {
-	return (((k->bank == BANK_GPA0 ? gpa0 : gpa2) >> k->pin) & 1) == 0;
+	return ((rd(k->bank + BANK_DAT) >> k->pin) & 1) == 0;
 }
 
 static void
 keys_poll(void)
 {
-	uint32_t gpa0 = rd(BANK_GPA0 + BANK_DAT), gpa2 = rd(BANK_GPA2 + BANK_DAT);
-
 	for (unsigned i = 0; i < NKEYS; i++) {
-		struct key *k = &keys[i];
-		bool now = key_held(k, gpa0, gpa2);
+		struct key *k = &keyset[i];
+		bool now = key_held(k);
 
 		if (!k->usable) {
 			continue;
@@ -135,33 +147,30 @@ keys_poll(void)
 static void
 keys_thread(__unused void *arg, __unused wait_result_t wr)
 {
-	uint32_t gpa0, gpa2;
-
-	alive = ml_io_map(ALIVE_PA, ALIVE_SIZE);
+	alive = ml_io_map(alive_pa, ALIVE_SIZE);
 	if (alive == 0) {
-		say("exynos_keys: cannot map the ALIVE GPIO block at 0x%lx\n", ALIVE_PA);
+		say("exynos_keys: cannot map the ALIVE GPIO block at 0x%lx\n", alive_pa);
 		thread_terminate(current_thread());
 		return;
 	}
-	gpa0 = rd(BANK_GPA0 + BANK_DAT);
-	gpa2 = rd(BANK_GPA2 + BANK_DAT);
 	for (unsigned i = 0; i < NKEYS; i++) {
-		struct key *k = &keys[i];
+		struct key *k = &keyset[i];
 		uint32_t con = (rd(k->bank + BANK_CON) >> (4 * k->pin)) & 0xf;
 
 		k->usable = con == 0x0 || con == 0xf;
-		k->last = key_held(k, gpa0, gpa2);
+		k->last = key_held(k);
 		k->live = k->usable && !k->last;
 		say("exynos_keys: %s: bank 0x%x pin %u, CON %x (%s), %s\n", k->name, k->bank, k->pin, con,
 		    con == 0 ? "input" : con == 0xf ? "interrupt" : "SOMETHING ELSE: not a key here, left alone",
 		    k->last ? "reads as held: believed once it has been seen released" : "released");
 	}
-	say("exynos_keys: watching every %u ms: power is the side button, Bixby the home button\n", POLL_MS);
+	say("exynos_keys: watching every %u ms: power is the side button%s\n", POLL_MS,
+	    keyset == keys ? ", Bixby the home button" : "");
 	for (unsigned tick = 1;; tick++) {
 		keys_poll();
 		if (tick % MINUTE_TICKS == 0) {
-			say("exynos_keys: a minute: presses power %u, volume-up %u, volume-down %u, bixby %u\n",
-			    keys[0].presses, keys[1].presses, keys[2].presses, keys[3].presses);
+			say("exynos_keys: a minute: presses power %u, volume-up %u, volume-down %u%s\n", keyset[0].presses,
+			    keyset[1].presses, keyset[2].presses, keyset == keys ? "" : " (the A50's)");
 		}
 		delay_for_interval(POLL_MS, NSEC_PER_MSEC);
 	}
@@ -175,6 +184,11 @@ hakios_exynos_keys_init(void)
 
 	if (!PE_parse_boot_argn("exynos_keys", &enabled, sizeof(enabled)) || enabled == 0) {
 		return;
+	}
+	if (enabled == 2) {
+		keyset = keys_a50;
+		nkeys = sizeof(keys_a50) / sizeof(keys_a50[0]);
+		alive_pa = ALIVE_PA_A50;
 	}
 	if (kernel_thread_start(keys_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);

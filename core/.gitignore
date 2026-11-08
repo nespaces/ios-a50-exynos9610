@@ -123,6 +123,15 @@ __pycache__/
 !/devices/manifest.conf
 !/devices/README.md
 !/devices/qemu/
+# the Galaxy A50 (SM-A505F*): kept here, not in a repository of its own; its build outputs are not
+!/devices/a50/
+/devices/a50/soc/shim/*.o
+/devices/a50/soc/shim/*.elf
+/devices/a50/soc/shim/fdt-test
+# working copies kept aside while porting
+*.before-*
+*.held
+*.diag
 
 # Android platform-tools for xl on a Mac (tools/macos-bin/README.md): not part of the repository
 /tools/macos-bin/platform-tools

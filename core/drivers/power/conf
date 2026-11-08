@@ -53,6 +53,12 @@ driver MAX77705
 	help    HSI2C and handed to HakiosBattery, the power source iOS reads (max77705=1; max77705_steps=N, max77705_ipclk=MHz); and its
 	help    haptic block, the vibration motor for iOS through /dev/hakios-haptic (max77705_haptic=1)
 
+driver SM5713
+	file    bsd/dev/hakios.sm5713.c
+	requires BATTERY
+	help    the Galaxy A50's battery: the fuel gauge and cable detector of its SM5713, read (never written) over i2c_1 (the
+	help    older Samsung I2C, polled by this file) and handed to HakiosBattery (sm5713=1; sm5713_steps=N, sm5713_scale=)
+
 driver EXYNOS_TMU
 	file    bsd/dev/hakios.exynos_tmu.c
 	requires EXYNOS_POWEROFF

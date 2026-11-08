@@ -40,6 +40,9 @@ DEVICES = {
     'starlte': dict(fd_base=0x8F000000, gzip=False, append_dtb=False, dtb_arg=False, header_size=True),
     # (no UEFI: the shim is the SoC repository's, socs/lga, and starts the loader itself)
     'frankel': dict(fd_base=0, shim=os.path.join('socs', 'lga', 'shim', 'shim.bin')),
+    # (no UEFI either: the device repository's own shim, devices/a50/soc/shim; S-Boot's packing: header v1,
+    # uncompressed, the device tree from the phone's dtb partition, no AVB)
+    'a50': dict(fd_base=0, shim=os.path.join('devices', 'a50', 'soc', 'shim', 'shim.bin'), samsung=True),
 }
 TARGET = os.environ.get('UEFI_TARGET') or 'redwood'
 if TARGET not in DEVICES:
@@ -101,14 +104,22 @@ def shim_image():
     open(ramdisk, 'wb').write(gzip.compress(cpio, 9, mtime=0))
     try:
         cmd = [mkbootimg] if not mkbootimg.endswith('.py') else [sys.executable, mkbootimg]
-        subprocess.check_call(cmd + ['--header_version', '4', '--kernel', kernel, '--ramdisk', ramdisk,
-                                     '--cmdline', os.environ.get('BOOT_CMDLINE', ''),
-                                     '--os_version', os.environ.get('OS_VERSION', '16.0.0'),
-                                     '--os_patch_level', os.environ.get('OS_PATCH_LEVEL', '2026-10'), '-o', args.output])
+        if DEV.get('samsung'):
+            # S-Boot takes a header v1 image, the kernel uncompressed; its device tree is the phone's own
+            subprocess.check_call(cmd + ['--header_version', '1', '--kernel', kernel, '--ramdisk', ramdisk,
+                                         '-o', args.output])
+        else:
+            subprocess.check_call(cmd + ['--header_version', '4', '--kernel', kernel, '--ramdisk', ramdisk,
+                                         '--cmdline', os.environ.get('BOOT_CMDLINE', ''),
+                                         '--os_version', os.environ.get('OS_VERSION', '16.0.0'),
+                                         '--os_patch_level', os.environ.get('OS_PATCH_LEVEL', '2026-10'), '-o', args.output])
     finally:
         os.unlink(kernel)
         os.unlink(ramdisk)
     size = os.path.getsize(args.output)
+    if DEV.get('samsung'):
+        print(f'{args.output}: {size} bytes (a50: boot image v1 of shim {len(shim)} + payload, no AVB)')
+        return
     avbtool = find_tool('AVBTOOL', ['avbtool', 'avbtool.py'], [])
     if avbtool is None:
         print(f'{args.output}: {size} bytes, WITHOUT an AVB footer (no avbtool: AVBTOOL=...); a Pixel may refuse it')

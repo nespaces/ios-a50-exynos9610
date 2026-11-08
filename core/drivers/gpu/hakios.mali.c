@@ -199,10 +199,20 @@ say(const char *format, ...)
 
 #define STARLTE_SOC_BASE        0x10000000UL    /* where the loader's platform "starlte" says the SoC's registers begin */
 
-#define PMU_PHYS                0x14060000UL    /* the PMU */
+/*
+ * The SoC's addresses: the Exynos 9810's (the S9) unless boot-arg mali_soc=9610 (the Galaxy A50: Mali-G72 MP3 at
+ * 0x11500000, PMU 0x11860000 with pd-g3d at +0x4060/+0x4064, CMU_G3D 0x11430000 with PLL_G3D's CON0 at +0x120 in the
+ * same field layout, the DTZPC at 0x11410204: Samsung's 4.14 kernel for it, exynos9610.dts, pmucal_local_exynos9610.h,
+ * cmucal-sfr.c; the port's analysis notes). On the 9610 only step 1 is made so far: the rest (ACPM, the PMIC's BUCK5, the
+ * PLL's 1052X rates) is the 9810's and not yet the A50's.
+ */
+static unsigned long mali_pmu_phys = 0x14060000UL, mali_cmu_phys = 0x17400000UL, mali_gpu_phys = 0x17500000UL;
+static uint32_t mali_pmu_cfg = 0x4040, mali_pmu_status = 0x4044, mali_pll_con0 = 0x140, mali_pll_con2 = 0x148;
+static uint32_t mali_dtzpc = 0x17410204u, mali_soc = 9810, mali_peek, mali_mux_busd = 0x1000;
+#define PMU_PHYS                mali_pmu_phys   /* the PMU */
 #define PMU_SIZE                0x5000
-#define PMU_G3D_CONFIGURATION   0x4040          /* 0x14064040: [3:0] = 0xF asks for pd-embedded_g3d on, 0 off */
-#define PMU_G3D_STATUS          0x4044          /* 0x14064044: [3:0] = 0xF when it is on */
+#define PMU_G3D_CONFIGURATION   mali_pmu_cfg    /* 0x14064040: [3:0] = 0xF asks for pd-embedded_g3d on, 0 off */
+#define PMU_G3D_STATUS          mali_pmu_status /* 0x14064044: [3:0] = 0xF when it is on */
 #define G3D_ON                  0xfu
 #define G3D_WAIT_US             100000u         /* (the S9+ port waits 10 ms) */
 /* the G3D's low-power settings of Samsung's pmucal_lpm_init, made before the domain is switched off: offset, mask, value */
@@ -214,13 +224,13 @@ static const struct { uint32_t at, mask, value; const char *name; } g3d_lpm[] = 
 	{ 0x15ac, 0x1u, 0x1u, "PWR_EMBEDDED_G3D" },
 };
 
-#define CMU_G3D_PHYS            0x17400000UL
+#define CMU_G3D_PHYS            mali_cmu_phys
 #define CMU_G3D_SIZE            0x2000          /* the bus dividers are at +0x1800 */
 #define PLL_LOCKTIME            0x000
 #define MUX_G3D_USER            0x100           /* PLL_CON0_MUX_CLKCMU_EMBEDDED_G3D_USER: MUX_SEL set on, cleared off */
-#define PLL_CON0                0x140           /* PLL_G3D */
-#define PLL_CON2                0x148           /* PLL_CON2_LOCK while the PLL locks and the domain is on, _OFF after */
-#define MUX_CLK_G3D_BUSD        0x1000
+#define PLL_CON0                mali_pll_con0   /* PLL_G3D */
+#define PLL_CON2                mali_pll_con2           /* PLL_CON2_LOCK while the PLL locks and the domain is on, _OFF after */
+#define MUX_CLK_G3D_BUSD        mali_mux_busd   /* 0x1000 on the 9810, 0x1004 on the 9610 */
 #define DIV_CLK_G3D_BUSD        0x1800
 #define DIV_CLK_G3D_BUSP        0x1804
 #define CLK_CON_BUSY            (1u << 16)
@@ -243,6 +253,10 @@ static const struct g3d_rate { uint32_t mhz, m, p, s; } g3d_rates[] = {
 	{ 260, 160, 4, 2 },                     /* S-Boot's own: the VCO at 1040 MHz */
 	{ 455, 140, 4, 1 },                     /* 910 */
 	{ 572, 176, 4, 1 },                     /* 1144 */
+	/* the A50's (PLL_1052X, S 0 as Samsung's own pll_g3d rows: 26 / 13 = 2 MHz, VCO 764): its fvmap's 764 MHz, 775 mV */
+	{ 764, 382, 13, 0 },
+	/* its fvmap's 683 MHz, 737.5 mV: VCO 1366 MHz, S 1 as Samsung's 550 MHz row (M 550, P 13, S 1) */
+	{ 683, 683, 13, 1 },
 };
 static uint32_t mali_mhz = 260;
 static bool pll_quiet;                          /* the governor's switches: a line only when one fails */
@@ -251,9 +265,9 @@ static uint32_t mali_pll = 1;                   /* mali_pll=0: PLL_G3D as the bo
 #define DTZPC_SMC               0x82000410u     /* Samsung's SiP call, SMC_CMD_PREPARE_PD_ONOFF */
 #define DTZPC_SAVE              0u              /* before the domain's power goes */
 #define DTZPC_RESTORE           1u              /* after it has come */
-#define DTZPC_G3D               0x17410204u
+#define DTZPC_G3D               mali_dtzpc
 
-#define MALI_PHYS               0x17500000UL
+#define MALI_PHYS               mali_gpu_phys
 #define MALI_SIZE               0x5000
 #define MALI_G72                0x6221u         /* GPU_ID >> 16 */
 
@@ -268,10 +282,13 @@ static bool gpu_answered;               /* step 4 read a G72: a soft reset befor
  * written, never above 0x68 (950 mV, the regulator's most in the phone's device tree), and read back; B6CTRL is read,
  * for the log. Put back as found when this driver switches the domain off again. Boot-arg mali_acpm=0: none of it.
  */
-#define B6CTRL                  0x2a            /* [7:6]: 11 always on, 10 the G3D power pin's (g3d_en), 00 off */
-#define B6OUT                   0x2b            /* 300 mV + 6.25 mV a step */
+static uint8_t mali_rail_ctrl = 0x2a, mali_rail_out = 0x2b, mali_rail_most = 0x68;
+#define B6CTRL                  mali_rail_ctrl  /* 9610: S2MPU09 BUCK5 CTRL 0x20 */ /* was 0x2a */
+#define B6CTRL_9810             0x2a            /* [7:6]: 11 always on, 10 the G3D power pin's (g3d_en), 00 off */
+#define B6OUT                   mali_rail_out   /* 9610: BUCK5 OUT 0x21 */ /* was 0x2b */
+#define B6OUT_9810              0x2b            /* 300 mV + 6.25 mV a step */
 #define B6OUT_950MV             0x68
-#define B6OUT_MOST              0x68
+#define B6OUT_MOST              mali_rail_most  /* 9610: 0x6f, 993.75 mV, the top of its fvmap */
 #define RAIL_SETTLE_US          200
 #define RAIL_TRIES              10              /* 100 ms apart: the APM may not answer at once */
 static uint32_t mali_acpm = 1;
@@ -1039,8 +1056,15 @@ step_look(void)
 	say("mali: 1: CMU_G3D +0x100 %#x (the G3D on %s), MUX_CLK_G3D_BUSD %#x, DIV_CLK_G3D_BUSD %#x, DIV_CLK_G3D_BUSP %#x\n",
 	    rd(cmu_g3d, MUX_G3D_USER), (rd(cmu_g3d, MUX_G3D_USER) & MUX_SEL) ? "CMU's clock" : "the oscillator",
 	    rd(cmu_g3d, MUX_CLK_G3D_BUSD), rd(cmu_g3d, DIV_CLK_G3D_BUSD), rd(cmu_g3d, DIV_CLK_G3D_BUSP));
-	say("mali: 1: the GPU's own registers are not read before step 2 has raised its supply (S-Boot's 260 MHz at 644 mV "
-	    "hung the S9+'s SoC when its GPU was read and reset)\n");
+	if (mali_soc == 9610 && mali_peek && (status & G3D_ON) == G3D_ON) {
+		/* the A50 (mali_peek=1): the GPU's identity, read only, with the domain S-Boot left on */
+		say("mali: 1: the 9610's domain is on: GPU_ID %#x, L2_FEATURES %#x, GPU_STATUS %#x, SHADER_PRESENT %#x, "
+		    "TILER_PRESENT %#x, L2_PRESENT %#x\n", rd(mali, 0x0), rd(mali, 0x4), rd(mali, 0x34), rd(mali, 0x100),
+		    rd(mali, 0x110), rd(mali, 0x120));
+	} else {
+		say("mali: 1: the GPU's own registers are not read before step 2 has raised its supply (S-Boot's 260 MHz at 644 mV "
+		    "hung the S9+'s SoC when its GPU was read and reset)\n");
+	}
 	if (mali_acpm && (acpm_ok = hakios_acpm_init(say))) {
 		b6out_known = rail_read("as found", &b6out_found);
 	} else if (mali_acpm) {
@@ -1096,7 +1120,7 @@ step_power(void)
 		}
 	}
 	if (rate == NULL) {
-		say("mali: 2: mali_mhz=%u is not one of 260, 455, 572: 260\n", mali_mhz);
+		say("mali: 2: mali_mhz=%u is not one of 260, 455, 572, 764: 260\n", mali_mhz);
 		rate = &g3d_rates[0];
 	}
 	if (pll_is(rate)) {
@@ -2154,6 +2178,24 @@ hakios_mali_init(void)
 	(void)PE_parse_boot_argn("mali_pll", &mali_pll, sizeof(mali_pll));
 	(void)PE_parse_boot_argn("mali_mhz", &mali_mhz, sizeof(mali_mhz));
 	(void)PE_parse_boot_argn("mali_acpm", &mali_acpm, sizeof(mali_acpm));
+	(void)PE_parse_boot_argn("mali_soc", &mali_soc, sizeof(mali_soc));
+	(void)PE_parse_boot_argn("mali_peek", &mali_peek, sizeof(mali_peek));
+	if (mali_soc == 9610) {
+		mali_pmu_phys = 0x11860000UL;
+		mali_pmu_cfg = 0x4060;
+		mali_pmu_status = 0x4064;
+		mali_cmu_phys = 0x11430000UL;
+		mali_pll_con0 = 0x120;
+		mali_pll_con2 = 0x128;
+		mali_mux_busd = 0x1004;
+		mali_dtzpc = 0x11410204u;
+		mali_gpu_phys = 0x11500000UL;
+		/* the rail: S2MPU09's BUCK5 (vdd_g3d) through ACPM's PMIC channel (hakios.exynos_acpm.c with acpm_soc=9610),
+		 * at most the 993.75 mV of the top level of the A50's own fvmap (1053 MHz) */
+		mali_rail_ctrl = 0x20;
+		mali_rail_out = 0x21;
+		mali_rail_most = 0x6f;
+	}
 	(void)PE_parse_boot_argn("mali_gov", &mali_gov, sizeof(mali_gov));
 	(void)PE_parse_boot_argn("mali_nap_us", &mali_nap_us, sizeof(mali_nap_us));
 	mali_nap_us = mali_nap_us < 10 ? 10 : mali_nap_us > 1000 ? 1000 : mali_nap_us;
@@ -2173,6 +2215,12 @@ hakios_mali_init(void)
 	}
 	if (last_step > STEPS) {
 		last_step = STEPS;
+	}
+	if (mali_soc == 9610 && last_step > 1 && mali_pll != 0 && !mali_acpm) {
+		/* past step 1 only with the boot's clock and supply (mali_pll=0; ACPM is off on the 9610): the 1052X rates and
+		 * S2MPU09's BUCK5 are not this file's yet */
+		say("mali: mali_soc=9610: past step 1 only with mali_pll=0 (the boot's 260 MHz): mali=%u made 1\n", last_step);
+		last_step = 1;
 	}
 	if (kernel_thread_start(mali_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
