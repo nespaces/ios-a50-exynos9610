@@ -23,7 +23,7 @@ This is an independent hobby integration. It is not affiliated with or endorsed 
 | Sound | speaker: ABOX (CPU off) → UAIF2 → NXP TFA9872 (`abox=8 tfa9872=3`), volume from iOS |
 | Brightness | EA8076 panel via DSIM0 DCS 51, from Settings and Control Center |
 | Vibration | the motor via its GPIO-switched LDO (`vib=1`) |
-| Not yet | Wi-Fi (Samsung SCSC S620, a driver of its own), camera (and so the flashlight), ringtones (AAC), modem; UI stalls when going home |
+| Not yet | Wi-Fi (Samsung SCSC S620, a driver of its own), camera (and so the flashlight), ringtones (AAC), modem |
 
 ## Building
 

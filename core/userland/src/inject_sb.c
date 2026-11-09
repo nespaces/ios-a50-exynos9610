@@ -2531,6 +2531,209 @@ brightness_bridge(const char *arguments)
 	dispatch_resume(timer);
 }
 
+
+/*
+ * Boot-arg sb_hang=1: SpringBoard's main thread watched from inside. A thread of ours sends the main queue an empty
+ * block every 250 ms; when one is not run within 1.5 s the main thread is stopped for a moment, its stack read by its
+ * frame pointers (this process's own memory), and let go -- then, with nothing held, each address is named: the
+ * image, its nearest exported symbol, and the nearest Objective-C method of that image. Again every 2 s while the
+ * stall lasts (at most 6 times), and how long it lasted when the main queue answers.
+ */
+#include <pthread.h>
+
+static mach_port_t hang_main_thread;
+static volatile uint64_t hang_pong;
+
+static uint64_t
+hang_ms(void)
+{
+	return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000;
+}
+
+static bool
+hang_read(uintptr_t address, void *out, size_t size)
+{
+	vm_size_t got = 0;
+
+	return vm_read_overwrite(mach_task_self(), (vm_address_t)address, size, (vm_address_t)out, &got) == KERN_SUCCESS &&
+	       got == size;
+}
+
+static unsigned
+hang_stack(uintptr_t *frames, unsigned max)
+{
+	arm_thread_state64_t state;
+	mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+	unsigned n = 0;
+
+	if (thread_suspend(hang_main_thread) != KERN_SUCCESS) {
+		return 0;
+	}
+	if (thread_get_state(hang_main_thread, ARM_THREAD_STATE64, (thread_state_t)&state, &count) == KERN_SUCCESS) {
+		uintptr_t fp = (uintptr_t)arm_thread_state64_get_fp(state);
+
+		frames[n++] = (uintptr_t)arm_thread_state64_get_pc(state);
+		frames[n++] = (uintptr_t)arm_thread_state64_get_lr(state);
+		while (n < max && fp != 0 && (fp & 7) == 0) {
+			uintptr_t pair[2];
+
+			if (!hang_read(fp, pair, sizeof(pair)) || pair[1] == 0) {
+				break;
+			}
+			frames[n++] = pair[1];
+			if (pair[0] <= fp) {
+				break;
+			}
+			fp = pair[0];
+		}
+	}
+	(void)thread_resume(hang_main_thread);
+	return n;
+}
+
+/* the nearest method of `image`'s classes at or below `address` */
+static void
+hang_objc_name(const char *image, uintptr_t address, char *out, size_t size)
+{
+	unsigned count = 0;
+	const char **names = objc_copyClassNamesForImage(image, &count);
+	uintptr_t best = 0;
+
+	out[0] = 0;
+	for (unsigned c = 0; names != NULL && c < count; c++) {
+		Class cls = objc_getClass(names[c]);
+
+		for (int meta = 0; cls != NULL && meta < 2; meta++) {
+			Class k = meta ? object_getClass((id)cls) : cls;
+			unsigned m = 0;
+			Method *methods = class_copyMethodList(k, &m);
+
+			for (unsigned i = 0; i < m; i++) {
+				uintptr_t imp = (uintptr_t)method_getImplementation(methods[i]);
+
+				if (imp <= address && imp > best && address - imp < 0x10000) {
+					best = imp;
+					snprintf(out, size, "%c[%s %s]+%#lx", meta ? '+' : '-', names[c], sel_getName(method_getName(methods[i])),
+					    address - imp);
+				}
+			}
+			free(methods);
+		}
+	}
+	free(names);
+}
+
+static void
+hang_say_stack(uintptr_t *frames, unsigned n)
+{
+	for (unsigned i = 0; i < n; i++) {
+		Dl_info info;
+		char objc[256] = "";
+		const char *image = "?", *symbol = "?";
+		uintptr_t offset = 0;
+
+		if (dladdr((void *)frames[i], &info) != 0) {
+			image = info.dli_fname ? (strrchr(info.dli_fname, '/') ? strrchr(info.dli_fname, '/') + 1 : info.dli_fname) : "?";
+			if (info.dli_sname != NULL) {
+				symbol = info.dli_sname;
+				offset = frames[i] - (uintptr_t)info.dli_saddr;
+			}
+			if (info.dli_fname != NULL) {
+				hang_objc_name(info.dli_fname, frames[i], objc, sizeof(objc));
+			}
+		}
+		say("hakios: sb_hang:   %2u %#lx %s %s+%#lx %s\n", i, frames[i], image, symbol, offset, objc);
+	}
+}
+
+static void *
+hang_watch_thread(__unused void *arg)
+{
+	pthread_setname_np("hakios.sb_hang");
+	for (;;) {
+		uint64_t sent = hang_ms(), stalled_at = 0;
+		unsigned samples = 0;
+
+		hang_pong = 0;
+		dispatch_async(dispatch_get_main_queue(), ^{
+			hang_pong = hang_ms();
+		});
+		for (;;) {
+			usleep(250000);
+			if (hang_pong != 0) {
+				break;
+			}
+			uint64_t now = hang_ms();
+
+			if (now - sent >= 1500 && samples < 6 && (stalled_at == 0 || now - stalled_at >= 2000)) {
+				uintptr_t frames[48];
+				unsigned n = hang_stack(frames, 48);
+
+				stalled_at = now;
+				say("hakios: sb_hang: the main thread has not answered for %llu ms (sample %u, %u frames):\n",
+				    now - sent, ++samples, n);
+				hang_say_stack(frames, n);
+			}
+		}
+		if (samples != 0) {
+			say("hakios: sb_hang: the main thread answered after %llu ms\n", hang_pong - sent);
+		}
+		usleep(250000);
+	}
+	return NULL;
+}
+
+static void
+hang_watch_start(void)
+{
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+	pthread_t thread;
+
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0 || strstr(arguments, "sb_hang=1") == NULL) {
+		return;
+	}
+	hang_main_thread = mach_thread_self();          /* (the constructor runs on the main thread) */
+	if (pthread_create(&thread, NULL, hang_watch_thread, NULL) == 0) {
+		pthread_detach(thread);
+		say("hakios: sb_hang: SpringBoard's main thread watched (stalls over 1.5 s are said with its stack)\n");
+	}
+}
+
+
+/*
+ * Going home stalled SpringBoard for seconds (sb_hang=1 caught it, 9 November): at the start of the switcher's gesture
+ * -[SBMainSwitcherControllerCoordinator switcherContentController:setCacheAsynchronousRenderingSurfaces:] asks the
+ * render server in backboardd to cache the apps' asynchronous surfaces (CARenderServerSetCacheAsynchronousSurfaces,
+ * from +[CATransaction flush]) and waits for its answer, which our window server gives seconds late. It only keeps
+ * surfaces around for the animation: not asked at all here (sb_async_cache=1 asks as before).
+ */
+static void
+no_async_surface_cache(__unused id self, __unused SEL selector, __unused id controller, __unused BOOL cache)
+{
+}
+
+static void
+async_surface_cache_off(void)
+{
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+	Class cls = objc_getClass("SBMainSwitcherControllerCoordinator");
+	Method method = cls ? class_getInstanceMethod(cls,
+	    sel_registerName("switcherContentController:setCacheAsynchronousRenderingSurfaces:")) : NULL;
+
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "sb_async_cache=1") != NULL) {
+		return;
+	}
+	if (method == NULL) {
+		say("hakios: -[SBMainSwitcherControllerCoordinator switcherContentController:setCacheAsynchronousRenderingSurfaces:] "
+		    "not found; left alone\n");
+		return;
+	}
+	method_setImplementation(method, (IMP)no_async_surface_cache);
+	say("hakios: the switcher no longer asks the render server to cache asynchronous surfaces (it stalled going home)\n");
+}
+
 __attribute__((constructor))
 static void
 hakios_springboard_init(void)
@@ -2558,6 +2761,8 @@ hakios_springboard_init(void)
 		return;
 	}
 	caenv();
+	hang_watch_start();
+	async_surface_cache_off();
 	/*
 	 * The tweaks of the package manager's prefix, if one is installed: ElleKit's loader
 	 * (/var/jb/usr/lib/TweakLoader.dylib) reads /var/jb/usr/lib/TweakInject and opens the tweaks
