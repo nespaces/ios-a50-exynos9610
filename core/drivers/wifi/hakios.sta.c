@@ -26,13 +26,17 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <sys/errno.h>
+#include <sys/fcntl.h>
 #include <sys/hakios.input.h>
 #include <sys/hakios.sta.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
+#include <sys/vnode.h>
 
 extern void thread_set_thread_name(thread_t thread, const char *name);
 extern void loader_log_line(const char *line);
 extern kern_return_t thread_terminate(thread_t thread);
+extern vnode_t rootvnode;
 
 #define HEARD_MOST      128
 #define CHANNELS_MOST   96
@@ -52,6 +56,110 @@ static struct hakios_sta_scan asked_scan_what;
 static struct hakios_sta_join asked_join_what;
 static struct hakios_sta_join standing;        /* the network joined whenever the radio comes on (ssid_length 0: none) */
 static struct hakios_sta_join fallback;        /* ... as it was before a join that has not come through yet */
+static bool auto_join_pending;                 /* scan first, then standing, once after power/attach */
+
+#define NETWORK_PATH    "/private/var/hakios-wifi"
+
+static void
+network_save(const struct hakios_sta_join *what)
+{
+	vfs_context_t ctx;
+	vnode_t vnode = NULLVP;
+	char body[160];
+	int n, left = 0, error;
+
+	if (what == NULL || what->ssid_length == 0 || rootvnode == NULLVP) {
+		return;
+	}
+	n = 0;
+	memcpy(body, what->ssid, what->ssid_length);
+	n += what->ssid_length;
+	body[n++] = '\n';
+	if (what->passphrase_length != 0 && what->passphrase_length <= 63) {
+		memcpy(body + n, what->passphrase, what->passphrase_length);
+		n += what->passphrase_length;
+	} else {
+		static const char hex[] = "0123456789abcdef";
+		unsigned i;
+
+		for (i = 0; i < 32; i++) {
+			body[n++] = hex[what->pmk[i] >> 4];
+			body[n++] = hex[what->pmk[i] & 0xf];
+		}
+	}
+	body[n++] = '\n';
+	ctx = vfs_context_kernel();
+	error = vnode_open(NETWORK_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0600, 0, &vnode, ctx);
+	if (error != 0) {
+		hakios_wifi_tell("wifi: standing network not saved (open %d)\n", error);
+		return;
+	}
+	error = vn_rdwr(UIO_WRITE, vnode, body, n, 0, UIO_SYSSPACE, IO_SYNC, vfs_context_ucred(ctx), &left,
+	    vfs_context_proc(ctx));
+	(void)vnode_close(vnode, FWASWRITTEN, ctx);
+	memset_s(body, sizeof(body), 0, sizeof(body));
+	hakios_wifi_tell("wifi: standing network %s (%u-byte name)\n", error == 0 && left == 0 ? "saved" : "not written",
+	    what->ssid_length);
+}
+
+static bool
+network_load(struct hakios_sta_join *what)
+{
+	vfs_context_t ctx;
+	vnode_t vnode = NULLVP;
+	char body[160];
+	int n, left = 0, i;
+	char *nl, *nl2;
+
+	if (what == NULL || rootvnode == NULLVP) {
+		return false;
+	}
+	bzero(what, sizeof(*what));
+	ctx = vfs_context_kernel();
+	if (vnode_lookup(NETWORK_PATH, 0, &vnode, ctx) != 0) {
+		return false;
+	}
+	n = (int)sizeof(body) - 1;
+	if (vn_rdwr(UIO_READ, vnode, body, n, 0, UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &left, vfs_context_proc(ctx)) != 0) {
+		vnode_put(vnode);
+		return false;
+	}
+	vnode_put(vnode);
+	n -= left;
+	body[n < 0 ? 0 : n] = 0;
+	nl = strchr(body, '\n');
+	if (nl == NULL || nl == body || (unsigned)(nl - body) > 32) {
+		memset_s(body, sizeof(body), 0, sizeof(body));
+		return false;
+	}
+	what->ssid_length = (uint8_t)(nl - body);
+	memcpy(what->ssid, body, what->ssid_length);
+	nl2 = strchr(nl + 1, '\n');
+	n = (int)((nl2 != NULL ? nl2 : body + strlen(body)) - (nl + 1));
+	if (n >= 8 && n <= 63) {
+		what->security = HAKIOS_STA_WPA2_PSK;
+		what->passphrase_length = (uint8_t)n;
+		memcpy(what->passphrase, nl + 1, (unsigned)n);
+	} else if (n == 64) {
+		what->security = HAKIOS_STA_WPA2_PSK;
+		for (i = 0; i < 32; i++) {
+			unsigned hi = (unsigned char)nl[1 + 2 * i], lo = (unsigned char)nl[2 + 2 * i];
+
+			hi = hi >= 'a' ? hi - 'a' + 10 : hi >= 'A' ? hi - 'A' + 10 : hi - '0';
+			lo = lo >= 'a' ? lo - 'a' + 10 : lo >= 'A' ? lo - 'A' + 10 : lo - '0';
+			what->pmk[i] = (uint8_t)((hi << 4) | lo);
+		}
+	} else if (n == 0) {
+		what->security = HAKIOS_STA_OPEN;
+	} else {
+		bzero(what, sizeof(*what));
+		memset_s(body, sizeof(body), 0, sizeof(body));
+		return false;
+	}
+	memset_s(body, sizeof(body), 0, sizeof(body));
+	hakios_wifi_tell("wifi: standing network loaded (%u-byte name)\n", what->ssid_length);
+	return true;
+}
 
 static struct hakios_sta_bss *heard;           /* by the last scan that came to an end */
 static unsigned heard_count;
@@ -121,9 +229,10 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			}
 			hakios_apple80211_event(HAKIOS_STA_POWER, error == 0 ? power_on : !power_on);
 			lck_mtx_lock(&sta_lock);
-			if (error == 0 && power_on && standing.ssid_length != 0 && !asked_join) {
-				asked_join_what = standing;
-				asked_join = true;
+			if (error == 0 && power_on && standing.ssid_length != 0 && !asked_join && !asked_scan) {
+				auto_join_pending = true;
+				bzero(&asked_scan_what, sizeof(asked_scan_what));
+				asked_scan = true;
 			}
 			lck_mtx_unlock(&sta_lock);
 		} else if (leave) {
@@ -131,6 +240,12 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			hakios_apple80211_event(HAKIOS_STA_LINK, 0);
 		} else if (do_join) {
 			error = ops->join(&join);
+			if (error == 0) {
+				lck_mtx_lock(&sta_lock);
+				standing = join;
+				lck_mtx_unlock(&sta_lock);
+				network_save(&join);
+			}
 			bzero(&join, sizeof(join));
 			hakios_apple80211_event(HAKIOS_STA_JOIN_DONE, error);
 			if (error == 0) {
@@ -151,6 +266,15 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			lck_mtx_unlock(&sta_lock);
 			ops->heard(heard_one, NULL);
 			hakios_apple80211_event(HAKIOS_STA_SCAN_DONE, error);
+			lck_mtx_lock(&sta_lock);
+			if (auto_join_pending) {
+				auto_join_pending = false;
+				if (standing.ssid_length != 0 && !asked_join && !asked_leave && !asked_power) {
+					asked_join_what = standing;
+					asked_join = true;
+				}
+			}
+			lck_mtx_unlock(&sta_lock);
 		}
 
 		lck_mtx_lock(&sta_lock);
@@ -195,10 +319,23 @@ hakios_sta_attach(const struct hakios_sta_ops *ops)
 		sta_thread_made = true;
 	}
 	channel_count = ops->channels(channels, CHANNELS_MOST);
-	lck_mtx_lock(&sta_lock);
-	sta_ops = ops;
-	sta_on = true;
-	lck_mtx_unlock(&sta_lock);
+	{
+		struct hakios_sta_join saved;
+
+		bzero(&saved, sizeof(saved));
+		(void)network_load(&saved);
+		lck_mtx_lock(&sta_lock);
+		sta_ops = ops;
+		sta_on = true;
+		if (standing.ssid_length == 0 && saved.ssid_length != 0 && !asked_join) {
+			standing = saved;
+			auto_join_pending = true;
+			bzero(&asked_scan_what, sizeof(asked_scan_what));
+			asked_scan = true;
+		}
+		lck_mtx_unlock(&sta_lock);
+		memset_s(&saved, sizeof(saved), 0, sizeof(saved));
+	}
 	thread_wakeup((event_t)&sta_ops);
 	hakios_apple80211_event(HAKIOS_STA_POWER, 1);
 }
@@ -311,8 +448,10 @@ hakios_sta_ask_leave(void)
 	}
 	asked_leave = true;
 	asked_join = false;
+	auto_join_pending = false;
 	bzero(&asked_join_what, sizeof(asked_join_what));
 	bzero(&fallback, sizeof(fallback));
+	bzero(&standing, sizeof(standing));
 	lck_mtx_unlock(&sta_lock);
 	thread_wakeup((event_t)&sta_ops);
 	return 0;

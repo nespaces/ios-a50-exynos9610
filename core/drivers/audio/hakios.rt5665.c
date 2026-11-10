@@ -79,10 +79,15 @@ say(const char *format, ...)
 #define RT5665_PWR_DIG_2        0x0062
 #define RT5665_PWR_ANLG_1       0x0063
 #define RT5665_PWR_ANLG_2       0x0064
+#define RT5665_PWR_ANLG_3       0x0065
 #define RT5665_I2S1_SDP         0x0070
 #define RT5665_ADDA_CLK_1       0x0073
 #define RT5665_GLB_CLK          0x0080
+#define RT5665_PLL_CTRL_1       0x0081
+#define RT5665_PLL_CTRL_2       0x0082
 #define RT5665_CLK_DET          0x006b
+#define RT5665_DIG_MISC         0x00fa
+#define RT5665_CHOP_ADC         0x013b
 #define RT5665_DEVICE_ID        0x00ff
 #define RT5665_ID_VALUE         0x6451
 
@@ -90,6 +95,11 @@ say(const char *format, ...)
 #define PWR_ADC_L1              (1u << 4)
 #define PWR_ADC_S1F             (1u << 15)
 #define PWR_VREF1               (1u << 15)
+#define PWR_VREF2               (1u << 13)
+#define PWR_FV2                 (1u << 12)
+#define PWR_LDO                 (1u << 8)       /* PWR_DIG_1 */
+#define DIG_GATE_CTRL           (1u << 0)
+#define CKGEN_ADC1              (1u << 12)
 #define PWR_FV1                 (1u << 14)
 #define PWR_MB                  (1u << 9)
 #define PWR_BG                  (1u << 7)
@@ -97,8 +107,13 @@ say(const char *format, ...)
 #define PWR_BST3                (1u << 13)
 #define PWR_MB2                 (1u << 10)
 #define PWR_BST3_P              (1u << 5)
+#define PWR_RM1_L               (1u << 1)
+#define PWR_PLL                 (1u << 6)
 #define I2S_MS_S                (1u << 15)
 #define IN3_DF                  (1u << 15)
+#define SCLK_SRC_PLL1           (1u << 14)
+#define PLL1_SRC_BCLK1          (1u << 8)
+#define I2S_PD1_2               (1u << 12)
 
 static vm_offset_t i2c, top;
 static uint32_t scale = SCALE;
@@ -250,26 +265,80 @@ reg_set(uint16_t reg, uint16_t bits)
 	return error != 0 ? error : reg_write(reg, v | bits);
 }
 
+/* IN3 -> BST3 -> RECMIX1L -> ADC1 L -> Stereo1 ADC (source ADC, not DD Mux) -> I2S1 slave.
+ * PLL1 from UAIF0 BCLK (1.536 MHz) to 24.576 MHz, as exynos9610-rt5665.c hw_params. */
 static void
-codec_thread(void *arg, __unused wait_result_t result)
+mic_path(bool settle)
 {
-	uint32_t steps = (uint32_t)(uintptr_t)arg, step = 0;
+	uint16_t mix = 0, glb = 0, rec = 0;
+
+	/*
+	 * What Samsung's driver switches on outside the capture route, by the codec's bias level (rt5665.c
+	 * rt5665_set_bias_level()): STANDBY sets PWR_DIG_1's LDO (the digital core's supply) and PREPARE sets DIG_MISC's
+	 * gate (the digital blocks' clock). Without them the ADC's filter and the I2S never run: WDMA1 recorded at the
+	 * right rate and every sample was 0 (10 November). And of the route itself: ADC1 L needs "ADC1 clock" (CHOP_ADC
+	 * bit 12) and Vref2 as well as Vref1 (rt5665_dapm_routes).
+	 */
+	(void)reg_set(RT5665_PWR_DIG_1, PWR_LDO);
+	(void)reg_set(RT5665_PWR_ANLG_1, PWR_VREF1 | PWR_VREF2 | PWR_MB | PWR_BG | PWR_LDO1_DVO_12);
+	if (settle) {
+		delay(15000);
+	}
+	(void)reg_set(RT5665_PWR_ANLG_1, PWR_FV1 | PWR_FV2);
+	(void)reg_set(RT5665_DIG_MISC, DIG_GATE_CTRL);
+	(void)reg_set(RT5665_CHOP_ADC, CKGEN_ADC1);
+	(void)reg_set(RT5665_PWR_ANLG_2, PWR_BST3 | PWR_MB2 | PWR_BST3_P | PWR_RM1_L);
+	(void)reg_set(RT5665_PWR_ANLG_3, PWR_PLL);
+	(void)reg_set(RT5665_IN3_IN4, IN3_DF | (0x2c << 8));
+	(void)reg_write(RT5665_REC1_L2_MIXER, 0x00f7);          /* BST3 unmute (bit 3) */
+	(void)reg_set(RT5665_PWR_DIG_1, PWR_I2S1_1 | PWR_ADC_L1);
+	(void)reg_set(RT5665_PWR_DIG_2, PWR_ADC_S1F);
+	(void)reg_write(RT5665_STO1_ADC_MIXER, 0x6060);         /* ADC1 L/R unmute, src = ADC */
+	(void)reg_write(RT5665_STO1_ADC_DIG_VOL, 0x2f2f);
+	(void)reg_write(RT5665_I2S1_SDP, I2S_MS_S);
+	(void)reg_write(RT5665_PLL_CTRL_1, 0x1f02);             /* N=62 K=2: 1.536 MHz -> 24.576 MHz */
+	(void)reg_write(RT5665_PLL_CTRL_2, 0x0800);             /* M bypass */
+	(void)reg_write(RT5665_GLB_CLK, SCLK_SRC_PLL1 | PLL1_SRC_BCLK1);
+	(void)reg_write(RT5665_ADDA_CLK_1, I2S_PD1_2);          /* PD1 /2: 512fs / 256 */
+	(void)reg_write(RT5665_CLK_DET, 0x0001);
+	(void)reg_read(RT5665_STO1_ADC_MIXER, &mix);
+	(void)reg_read(RT5665_GLB_CLK, &glb);
+	(void)reg_read(RT5665_REC1_L2_MIXER, &rec);
+	say("rt5665: path REC1_L2 %#06x STO1 %#06x GLB %#06x\n", rec, mix, glb);
+	{
+		uint16_t d1 = 0, d2 = 0, a1 = 0, a2 = 0, a3 = 0, misc = 0, chop = 0;
+
+		(void)reg_read(RT5665_PWR_DIG_1, &d1);
+		(void)reg_read(RT5665_PWR_DIG_2, &d2);
+		(void)reg_read(RT5665_PWR_ANLG_1, &a1);
+		(void)reg_read(RT5665_PWR_ANLG_2, &a2);
+		(void)reg_read(RT5665_PWR_ANLG_3, &a3);
+		(void)reg_read(RT5665_DIG_MISC, &misc);
+		(void)reg_read(RT5665_CHOP_ADC, &chop);
+		say("rt5665: power DIG %#06x %#06x ANLG %#06x %#06x %#06x DIG_MISC %#06x CHOP_ADC %#06x\n", d1, d2, a1, a2, a3,
+		    misc, chop);
+	}
+}
+
+static int
+codec_bringup(void)
+{
 	uint16_t id = 0;
 
-	say("rt5665: 1: I2C_6 (0x13890000) pins gpp1-5/gpp1-4, chip 0x1b\n");
-	i2c = ml_io_map(I2C_PA, 0x1000);
-	top = ml_io_map(TOP_PA, 0x1000);
+	if (ready) {
+		return 0;
+	}
+	say("rt5665: I2C_6 0x13890000 gpp1-5/4, chip 0x1b\n");
+	if (i2c == 0) {
+		i2c = ml_io_map(I2C_PA, 0x1000);
+	}
+	if (top == 0) {
+		top = ml_io_map(TOP_PA, 0x1000);
+	}
 	if (i2c == 0 || top == 0) {
 		say("rt5665: a block could not be mapped\n");
-		goto out;
+		return 1;
 	}
-	say("rt5665: 1: IICCON %#x IICSTAT %#x; gpp1 CON %#x DAT %#x PUD %#x\n", rd(i2c, IICCON), rd(i2c, IICSTAT),
-	    rd(top + GPP1, GPIO_CON), rd(top + GPP1, GPIO_DAT), rd(top + GPP1, GPIO_PUD));
-	if (++step >= steps) {
-		goto out;
-	}
-
-	say("rt5665: 2: pins to I2C, the bus master\n");
 	pin_field(top + GPP1, GPIO_CON, PIN_SDA, 2);
 	pin_field(top + GPP1, GPIO_CON, PIN_SCL, 2);
 	pin_field(top + GPP1, GPIO_PUD, PIN_SDA, 0);
@@ -279,39 +348,44 @@ codec_thread(void *arg, __unused wait_result_t result)
 	wr(i2c, IICCON, bus_con());
 	wr(i2c, IICSTAT, STAT_TXRXEN);
 	if (reg_read(RT5665_DEVICE_ID, &id) != 0 || id != RT5665_ID_VALUE) {
-		say("rt5665: 2: no RT5665 at 0x1b (id %#06x): nothing written\n", id);
-		goto out;
+		say("rt5665: no chip at 0x1b (id %#06x)\n", id);
+		return 1;
 	}
-	say("rt5665: 2: DEVICE_ID %#06x\n", id);
-	if (++step >= steps) {
-		goto out;
-	}
-
-	say("rt5665: 3: reset, analog, MICBIAS2, IN3, ADC, I2S1 slave of UAIF0\n");
+	say("rt5665: DEVICE_ID %#06x\n", id);
 	(void)reg_write(RT5665_RESET, 0);
 	delay(20000);
 	if (reg_read(RT5665_DEVICE_ID, &id) != 0 || id != RT5665_ID_VALUE) {
-		say("rt5665: 3: ID gone after reset (%#06x)\n", id);
-		goto out;
+		say("rt5665: ID gone after reset (%#06x)\n", id);
+		return 1;
 	}
-	(void)reg_set(RT5665_PWR_ANLG_1, PWR_VREF1 | PWR_MB | PWR_BG | PWR_LDO1_DVO_12);
-	delay(20000);
-	(void)reg_set(RT5665_PWR_ANLG_1, PWR_FV1);
-	(void)reg_set(RT5665_PWR_ANLG_2, PWR_BST3 | PWR_MB2 | PWR_BST3_P | (1u << 1)); /* BST3, MICBIAS2, RECMIX1L */
-	(void)reg_set(RT5665_IN3_IN4, IN3_DF | (0x2c << 8));
-	/* mute bits, inverted: default 0x00ff; clear BST3 mute (bit 3) so IN3 reaches RECMIX1L */
-	(void)reg_write(RT5665_REC1_L2_MIXER, 0x00f7);
-	(void)reg_set(RT5665_PWR_DIG_1, PWR_I2S1_1 | PWR_ADC_L1);
-	(void)reg_set(RT5665_PWR_DIG_2, PWR_ADC_S1F);
-	/* default 0xc0c0 mutes ADC1; clear L/R ADC1 mute (bits 15 and 7) */
-	(void)reg_write(RT5665_STO1_ADC_MIXER, 0x4040);
-	(void)reg_write(RT5665_STO1_ADC_DIG_VOL, 0x2f2f);
-	(void)reg_write(RT5665_I2S1_SDP, I2S_MS_S);
-	(void)reg_write(RT5665_ADDA_CLK_1, 0x0000);            /* PD1 /1 */
-	(void)reg_write(RT5665_CLK_DET, 0x0001);               /* SYS clock detect */
+	mic_path(true);
 	ready = true;
-	say("rt5665: 3: MAINMIC (IN3) on, AIF1 a slave; abox_mic=1 records it through UAIF0\n");
-out:
+	say("rt5665: MAINMIC IN3 on, I2S1 slave, PLL from BCLK1\n");
+	return 0;
+}
+
+void
+hakios_rt5665_capture(bool on)
+{
+	uint16_t id = 0;
+
+	if (!on) {
+		return;
+	}
+	if (codec_bringup() != 0) {
+		return;
+	}
+	(void)reg_read(RT5665_DEVICE_ID, &id);
+	/* UAIF0 BCLK is running: PLL/mixers only, no VREF wait (this can run beside the speaker feeder). */
+	mic_path(false);
+	say("rt5665: capture: ID %#06x mixers rewritten\n", id);
+}
+
+static void
+codec_thread(void *arg, __unused wait_result_t result)
+{
+	(void)arg;
+	(void)codec_bringup();
 	(void)thread_terminate(current_thread());
 }
 
@@ -322,30 +396,14 @@ rt5665_init(void)
 	uint32_t steps = 0;
 	thread_t thread;
 
-	if (!PE_parse_boot_argn("rt5665", &steps, sizeof(steps)) || steps == 0) {
+	(void)PE_parse_boot_argn("rt5665", &steps, sizeof(steps));
+	say("rt5665: init steps %u\n", steps);
+	if (steps == 0) {
 		return;
 	}
-	if (kernel_thread_start(codec_thread, (void *)(uintptr_t)(steps > 3 ? 3 : steps), &thread) == KERN_SUCCESS) {
+	if (kernel_thread_start(codec_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
-}
-void
-hakios_rt5665_capture(bool on)
-{
-	uint16_t id = 0;
-
-	if (!ready || !on) {
-		return;
-	}
-	if (reg_read(RT5665_DEVICE_ID, &id) != 0) {
-		say("rt5665: capture: I2C failed\n");
-		return;
-	}
-	say("rt5665: capture: ID %#06x, mixers IN3->ADC->I2S1\n", id);
-	(void)reg_write(RT5665_REC1_L2_MIXER, 0x00f7);
-	(void)reg_write(RT5665_STO1_ADC_MIXER, 0x4040);
-	(void)reg_set(RT5665_PWR_ANLG_2, PWR_BST3 | PWR_MB2 | PWR_BST3_P | (1u << 1));
-	(void)reg_set(RT5665_PWR_DIG_1, PWR_I2S1_1 | PWR_ADC_L1);
 }
 
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, rt5665_init);

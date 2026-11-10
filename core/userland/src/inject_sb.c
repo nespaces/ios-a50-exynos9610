@@ -971,9 +971,9 @@ switcher_wallpaper_overlay(id self, SEL selector)
  * and with which class. That one line separates two very different diseases: our device never
  * reaching this process, and our device reaching it and refusing something.
  *
- * With siri_orb=0 among the boot-args the prewarm is skipped. That fixes nothing and is not meant
- * to: it asks what SpringBoard does NEXT, which is the only way to see the wall behind this one
- * while this one still stands.
+ * The prewarm is skipped unless siri_orb=1. Enabling Siri (the sheet, then the orb) ran it and
+ * aborted in MPS ("Failed to get MPSDevice": this Metal device answers Apple1, MPS wants Apple2).
+ * Skip keeps SpringBoard up; the orb is empty until metal_profile and MPS agree.
  */
 static void (*original_prewarm_orb_view_shaders)(id self, SEL selector);
 
@@ -996,7 +996,7 @@ prewarm_orb_view_shaders(id self, SEL selector)
 	id device = create ? create() : nil;
 
 	if (skip < 0) {
-		skip = boot_arg_is_set("siri_orb=0");
+		skip = !boot_arg_is_set("siri_orb=1");
 	}
 	if (create == NULL) {
 		say("hakios: Siri's orb: MTLCreateSystemDefaultDevice is not even a symbol here\n");

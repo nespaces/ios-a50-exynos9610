@@ -40,7 +40,7 @@ README for the table.
     ufs_native=4 ufs_native_slots=4 ufs_native_ref_fnv=<YOURS>
     ufs_native_write=userdata ufs_native_data=1 var_hfs=ufs_userdata_data var_save_ms=0
     system_apfs=ufs_system fb_threads=6 fb_rt=1 fb_ca_hz=120 fb_flip=1
-    vib=1 abox=8 tfa9872=3 ea8076=1 backlight=2 brightness_bridge=1 scsc=6
+    vib=1 abox=8 tfa9872=3 ea8076=1 backlight=2 brightness_bridge=1 scsc=6 rt5665=3 abox_mic=1
 
 XNU keeps only about 607 characters of the command line (the loader's own arguments included); whatever is past
 that is dropped without a word. So the A50's defaults live in the drivers: `acpm_soc=9610` also tells the Mali, UFS
@@ -65,6 +65,10 @@ print(hex(h))" lun0.bin`.
   the phone's Tfa9872.cnt says (gain as Samsung's, never more; no SpeakerBoost: hakios.guard.c limits the samples).
 - `ea8076=1 backlight=2 brightness_bridge=1`: the panel's brightness (DCS 51 through DSIM0) from Settings and
   Control Center.
+- `rt5665=3 abox_mic=1`: the microphone. The codec's bias level matters: Samsung's driver switches the digital core's LDO
+  (PWR_DIG_1 bit 8) and the clock gate (DIG_MISC bit 0) in `rt5665_set_bias_level()`, not in the capture route, so a
+  port that follows only the route reads zeros. Also ADC1's clock (CHOP_ADC bit 12), Vref2, and PLL1 from UAIF0's BCLK.
+- `scsc=8`: the Bluetooth mode of the same chip (experimental; `scsc=6` is Wi-Fi).
 - `scsc=6`: Wi-Fi. The SCSC S620 is powered through the PMU (the AP must hold its power, WLBT_CTRL_NS MASK_PWR_REQ,
   before its mailbox is touched: reading it otherwise stops the SoC), its firmware loaded into reserved DRAM and
   started (CFG_REQ, the TZPC through SMC, the BAAW windows, a keep-alive patch), then Maxwell's management streams,

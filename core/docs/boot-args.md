@@ -460,8 +460,8 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 |---|---|---|---|---|
 | `haptic` | K | `hakios.haptic.c` | `CONFIG_HAPTIC` |  |
 | `haptic_effect` | K | `hakios.haptic.c` | `CONFIG_HAPTIC_EFFECT` |  |
-| `torch` | KL | `hakios.s2mpb02_torch.c`, `hakios.sccam_torch.c`, `hakios.torch.c`, `loader.c` | `CONFIG_TORCH` |  |
-| `torch_max_s` | K | `hakios.s2mpb02_torch.c`, `hakios.torch.c` | `CONFIG_TORCH_MAX_S` |  |
+| `torch` | KL | `hakios.s2mpb02_torch.c`, `hakios.sccam_torch.c`, `hakios.torch.c`, `hakios.sm5713.c`, `loader.c` | `CONFIG_TORCH` |  |
+| `torch_max_s` | K | `hakios.s2mpb02_torch.c`, `hakios.torch.c`, `hakios.sm5713.c` | `CONFIG_TORCH_MAX_S` |  |
 | `torch_secs` | K | `hakios.s2mpb02_torch.c`, `hakios.torch.c` | `CONFIG_TORCH_SECS` |  |
 
 ## Chip, thermal and PMIC (19)

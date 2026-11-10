@@ -6,6 +6,7 @@
  *   3  power, mx140.bin, the Maxwell manager and the WLAN service; 4 one ADD_VIF; 5 then one passive scan
  *   6  stays up: en0 and the station (power, passive scan, the networks). A join is WPA2-PSK
  *      with CCMP, or an open network; other protection is refused
+ *   7  one Bluetooth HCI Reset; 8 BLE scan and experimental iOS HCI command/event transport
  * Facts: the A50 kernel's drivers/misc/samsung/scsc (GPL-2.0, read for facts, not copied):
  * mif_reg_S5E9610.h (offsets, bits), platform_mif_9610.c (the sequences); the phone's device tree.
  */
@@ -25,6 +26,13 @@
 #include <sys/hakios.sta.h>
 #include <sys/hakios.macaddr.h>
 #include <sys/random.h>
+#ifdef HAKIOS_BCM4361_BT
+#include <kern/clock.h>
+#include <sys/kern_control.h>
+#include <sys/proc.h>
+#include <sys/tty.h>
+#include <sys/ttycom.h>
+#endif
 #include "hakios.lx_wpa.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -394,6 +402,7 @@ mxconf_make(vm_offset_t mem, uint32_t runtime)
 }
 
 static bool wlan_started;
+static uint8_t bt_service_cfm;
 
 /* what the chip has put in the mxmgmt stream to the AP, said and taken */
 static unsigned
@@ -410,6 +419,9 @@ mgmt_take(vm_offset_t mem)
 		    m[5], m[6], m[7], m[8], m[0] == 0 && m[1] == 0 ? " -- MM_START_IND: Maxwell's firmware runs" :
 		    m[0] == 1 && m[2] == 1 ? " -- SM_MSG_START_CFM: the service started" : "");
 		if (m[0] == 1 && m[1] == 1 && m[2] == 1) { wlan_started = true; }
+		if (m[0] == 1 && m[1] == 2 && (m[2] == 1 || m[2] == 3)) {
+			bt_service_cfm = m[2];
+		}
 		*ri = (*ri + 1) % st->buf.num_packets;
 		__builtin_arm_dsb(0xf);
 		taken++;
@@ -2893,6 +2905,675 @@ log_dump(vm_offset_t mem, uint32_t panic_off)
 	}
 }
 
+
+/* Samsung BHCS v2 and BSMHCP offsets, verified against the A50 headers.
+ * Reserve the full protocol region even though this probe only uses HCI. */
+#define BT_PROTOCOL_SIZE       0x165c0u
+#define BT_PROTOCOL_MAGIC      0x155160c2u
+#define BT_CMD_WRITE           0x24
+#define BT_CMD_READ            0x44
+#define BT_EVT_READ            0x28
+#define BT_EVT_WRITE           0x48
+#define BT_CMD_BASE            0x100
+#define BT_EVT_BASE            0xa2c0
+#define BT_EVT_COUNT           32u
+#define BT_EVT_STRIDE          264u
+#define BT_R4_BG               6
+
+static bool
+bt_service_request(vm_offset_t mem, vm_offset_t mbox, uint8_t request, uint32_t ref)
+{
+	uint8_t packet[6] = { 2, request };
+
+	hip_put32(packet + 2, ref);
+	bt_service_cfm = 0;
+	if (!mgmt_send(mem, mbox, 1, packet, sizeof(packet))) {
+		return false;
+	}
+	for (unsigned i = 0; i < 200; i++) {
+		(void)mgmt_take(mem);
+		if (bt_service_cfm == request + 1) {
+			return true;
+		}
+		delay(10000);
+	}
+	return false;
+}
+
+
+/* One host writer at a time. The controller owns CMD_READ and EVT_WRITE. */
+static bool
+bt_hci_send(vm_offset_t protocol, vm_offset_t mbox, const uint8_t *data, unsigned length)
+{
+	uint32_t r = r32(protocol, BT_CMD_READ), w = r32(protocol, BT_CMD_WRITE);
+	if (length < 3 || length > 258 || length != data[2] + 3u || r >= 8 || w >= 8 || (w + 1) % 8 == r) {
+		return false;
+	}
+	uint8_t *slot = (uint8_t *)(protocol + BT_CMD_BASE + w * 260);
+	memcpy(slot + 2, data, length);
+	hip_put16(slot, length);
+	__builtin_arm_dsb(0xf);
+	w32(protocol, BT_CMD_WRITE, (w + 1) % 8);
+	__builtin_arm_dsb(0xf);
+	w32(mbox, INTGR1, 1u << BT_R4_BG);
+	return true;
+}
+
+/* 0: empty, -1: invalid indices, -2: malformed slot, positive: HCI event length. */
+static int
+bt_hci_peek(vm_offset_t protocol, uint8_t *data, uint32_t *index)
+{
+	uint32_t r = r32(protocol, BT_EVT_READ), w = r32(protocol, BT_EVT_WRITE);
+	if (r >= BT_EVT_COUNT || w >= BT_EVT_COUNT) { return -1; }
+	if (r == w) { return 0; }
+	__builtin_arm_dsb(0xf);
+	const uint8_t *slot = (const uint8_t *)(protocol + BT_EVT_BASE + r * BT_EVT_STRIDE);
+	unsigned length = hip_u16(slot);
+	*index = r;
+	if (length < 2 || length > 258 || length != slot[7] + 2u) { return -2; }
+	memcpy(data, slot + 6, length);
+	return length;
+}
+
+static void
+bt_hci_pop(vm_offset_t protocol, vm_offset_t mbox, uint32_t index)
+{
+	__builtin_arm_dsb(0xf);
+	w32(protocol, BT_EVT_READ, (index + 1) % BT_EVT_COUNT);
+	__builtin_arm_dsb(0xf);
+	w32(mbox, INTGR1, 1u << BT_R4_BG);
+}
+
+static bool
+bt_hci_command(vm_offset_t protocol, vm_offset_t mbox, const uint8_t *cmd, unsigned size, uint8_t *address)
+{
+	uint16_t opcode = hip_u16(cmd);
+	if (!bt_hci_send(protocol, mbox, cmd, size)) { return false; }
+	for (unsigned i = 0; i < 200; i++) {
+		uint8_t event[258];
+		uint32_t index;
+		int n = bt_hci_peek(protocol, event, &index);
+		if (n == -1) { break; }
+		if (n == 0) { delay(10000); continue; }
+		bt_hci_pop(protocol, mbox, index);
+		if (n >= 6 && event[0] == 0x0e && hip_u16(event + 3) == opcode) {
+			say("scsc-bt: HCI %#x Command Complete status %#x\n", opcode, event[5]);
+			if (address != NULL) {
+				if (n != 12 || event[5] != 0) { return false; }
+				memcpy(address, event + 6, 6);
+			}
+			return event[5] == 0;
+		}
+		if (n == 6 && event[0] == 0x0f && hip_u16(event + 4) == opcode && event[2] != 0) {
+			say("scsc-bt: HCI %#x Command Status %#x\n", opcode, event[2]);
+			return false;
+		}
+	}
+	say("scsc-bt: HCI %#x timed out, cmd read %u, event write %u\n", opcode, r32(protocol, BT_CMD_READ), r32(protocol, BT_EVT_WRITE));
+	return false;
+}
+
+static bool
+bt_ble_probe(vm_offset_t protocol, vm_offset_t mbox)
+{
+	/* Passive scanning. Interval 60 ms, window 30 ms, duplicate filtering. */
+	static const uint8_t event_mask[] = {0x01, 0x0c, 8, 0, 0, 0, 0, 0, 0, 0, 0x20}; /* LE Meta */
+	static const uint8_t le_mask[] = {0x01, 0x20, 8, 2, 0, 0, 0, 0, 0, 0, 0}; /* Advertising Report */
+	static const uint8_t params[] = {0x0b, 0x20, 7, 0, 0x60, 0, 0x30, 0, 0, 0};
+	static const uint8_t enable[] = {0x0c, 0x20, 2, 1, 1}, disable[] = {0x0c, 0x20, 2, 0, 0};
+	if (!bt_hci_command(protocol, mbox, event_mask, sizeof(event_mask), NULL) ||
+	    !bt_hci_command(protocol, mbox, le_mask, sizeof(le_mask), NULL) ||
+	    !bt_hci_command(protocol, mbox, params, sizeof(params), NULL)) {
+		return false;
+	}
+	if (!bt_hci_command(protocol, mbox, enable, sizeof(enable), NULL)) {
+		(void)bt_hci_command(protocol, mbox, disable, sizeof(disable), NULL);
+		return false;
+	}
+	unsigned reports = 0;
+	for (unsigned tick = 0; tick < 300; tick++) {
+		for (unsigned budget = 0; budget < 32; budget++) {
+			uint8_t event[258];
+			uint32_t index;
+			int n = bt_hci_peek(protocol, event, &index);
+			if (n == -1) { return false; }
+			if (n == 0) { break; }
+			bt_hci_pop(protocol, mbox, index);
+			if (n < 4 || event[0] != 0x3e || event[2] != 2) { continue; }
+			unsigned at = 4;
+			for (unsigned j = 0; j < event[3] && at + 10 <= (unsigned)n; j++) {
+				unsigned bytes = event[at + 8];
+				if (at + 10 + bytes > (unsigned)n) { break; }
+				if (reports++ < 8) {
+					say("scsc-bt: BLE report, address type %u, RSSI %d dBm, %u data bytes\n",
+					    event[at + 1], (int8_t)event[at + 9 + bytes], bytes);
+				}
+				at += 10 + bytes;
+			}
+		}
+		delay(10000);
+	}
+	say("scsc-bt: passive BLE scan received %u reports\n", reports);
+	return bt_hci_command(protocol, mbox, disable, sizeof(disable), NULL);
+}
+
+#ifdef HAKIOS_BCM4361_BT
+/* The existing BlueTool/IORegistry path expects H4 over a kernel control.
+ * BSMHCP supplies its own ACL buffer ownership and completion rings. */
+extern void HakiosBTNodeStart(const uint8_t *address, uint32_t speed);
+static LCK_GRP_DECLARE(scsc_bt_group, "scsc-bt");
+static LCK_MTX_DECLARE(scsc_bt_lock, &scsc_bt_group);
+static vm_offset_t bt_protocol, bt_mbox;
+static kern_ctl_ref bt_ctl;
+static uint32_t bt_unit;
+#define BT_ACL_COUNT 32u
+#define BT_ACL_BUFFERS 30u
+#define BT_ACL_BYTES 1024u
+#define BT_ACL_HANDLES 4096u
+static uint8_t bt_fragment[BT_ACL_BYTES + 5];
+static uint32_t bt_session;
+static struct { uint32_t session; uint16_t handle; bool busy; } bt_buffers[BT_ACL_BUFFERS];
+static struct { uint16_t cid; unsigned left; uint16_t rx_credits; } bt_links[BT_ACL_HANDLES];
+static unsigned bt_host_mtu, bt_host_count, bt_host_used;
+static bool bt_host_flow;
+static uint8_t bt_reply[8], bt_reporting;
+static unsigned bt_reply_len;
+static bool bt_reply_pending;
+static unsigned bt_used, bt_tx_said, bt_rx_said, bt_backpressure_said;
+static uint16_t bt_vs_opcode;              /* the vendor command whose completion is forged */
+static uint8_t bt_vs_first;                 /* its first parameter: the subopcode iOS matches */
+
+
+/* The kernel control terminates HCI host flow control. The firmware's ACL
+ * RX ring is separate, so never forward these host buffer commands to R4. */
+static errno_t
+bt_host_command(const uint8_t *cmd, unsigned length)
+{
+	uint16_t opcode = hip_u16(cmd);
+	uint8_t status = 0;
+	if (opcode == 0x0c35) {                    /* Host Number of Completed Packets */
+		if (length < 4 || length != 4u + 4u * cmd[3]) { return EINVAL; }
+		for (unsigned i = 0; i < cmd[3]; i++) {
+			uint16_t handle = hip_u16(cmd + 4 + 4 * i);
+			unsigned count = hip_u16(cmd + 6 + 4 * i);
+			if (handle >= BT_ACL_HANDLES) { return EINVAL; }
+			for (unsigned j = 0; j < i; j++) {
+				if (hip_u16(cmd + 4 + 4 * j) == handle) { count += hip_u16(cmd + 6 + 4 * j); }
+			}
+			if (count > bt_links[handle].rx_credits) { return EINVAL; }
+		}
+		for (unsigned i = 0; i < cmd[3]; i++) {
+			unsigned count = hip_u16(cmd + 6 + 4 * i);
+			bt_links[hip_u16(cmd + 4 + 4 * i)].rx_credits -= count;
+			bt_host_used -= count;
+		}
+		return 0;                         /* no completion event on success */
+	}
+	if (bt_reply_pending) { return ENOBUFS; }
+	if (opcode == 0x0c33) {                    /* Host Buffer Size */
+		if (length != 10 || hip_u16(cmd + 3) == 0 || hip_u16(cmd + 6) == 0 || bt_host_used != 0) {
+			status = 0x12;
+		} else {
+			bt_host_mtu = hip_u16(cmd + 3);
+			bt_host_count = hip_u16(cmd + 6);
+			say("scsc-bt: host ACL buffers %u x %u bytes\n", bt_host_count, bt_host_mtu);
+		}
+	} else if (opcode == 0x0c5a || opcode == 0x0c5b) {
+		/* Local setting for synchronous data reporting. BSMHCP has no
+		 * synchronous H4 ring in this firmware, so no SCO packets use it. */
+		if (opcode == 0x0c5a) {
+			if (length != 3) { status = 0x12; }
+		} else if (length != 4 || cmd[3] > 1) {
+			status = 0x12;
+		} else {
+			bt_reporting = cmd[3];
+		}
+	} else {                                  /* Set Controller To Host Flow Control */
+		if (length != 4 || cmd[3] > 3 || bt_host_used != 0) {
+			status = 0x12;
+		} else {
+			/* Bit 0 controls ACL. This transport has no synchronous HCI data path. */
+			bt_host_flow = (cmd[3] & 1u) != 0;
+		}
+		say("scsc-bt: host flow mode %u, status %#x\n", length == 4 ? cmd[3] : 0xff, status);
+	}
+	bool read_reporting = opcode == 0x0c5a && status == 0;
+	uint8_t reply[] = {4, 0x0e, read_reporting ? 5 : 4, 1, (uint8_t)opcode, (uint8_t)(opcode >> 8), status, bt_reporting};
+	bt_reply_len = read_reporting ? 8 : 7;
+	memcpy(bt_reply, reply, sizeof(reply));
+	say("scsc-bt: local HCI %#x status %#x\n", opcode, status);
+	bt_reply_pending = true;
+	return 0;
+}
+
+static void
+bt_acl_doorbell(void)
+{
+	__builtin_arm_dsb(0xf);
+	w32(bt_mbox, INTGR1, 1u << 7);            /* R4 foreground (M4 mode is excluded) */
+}
+
+static errno_t
+bt_acl_send(const uint8_t *h4, unsigned length)
+{
+	uint16_t handle = hip_u16(h4 + 1) & 0xfff;
+	uint8_t flags = h4[2] & 0xf0;
+	unsigned bytes = length - 5;
+	uint32_t r = r32(bt_protocol, 0x60), w = r32(bt_protocol, 0x2c);
+	if (r >= BT_ACL_COUNT || w >= BT_ACL_COUNT) { return EIO; }
+	if ((w + 1) % BT_ACL_COUNT == r) { return ENOBUFS; }
+	unsigned slot = 0;
+	while (slot < BT_ACL_BUFFERS && bt_buffers[slot].busy) { slot++; }
+	if (slot == BT_ACL_BUFFERS) { return ENOBUFS; }
+	unsigned left = bt_links[handle].left;
+	uint16_t cid = bt_links[handle].cid;
+	switch (flags & 0x30) {
+	case 0x00:
+	case 0x20:
+		if (bytes < 4) { return EINVAL; }
+		left = 4u + hip_u16(h4 + 5);
+		cid = hip_u16(h4 + 7);
+		break;
+	case 0x10:
+		if (left == 0) { return EINVAL; }
+		break;
+	default:
+		return EINVAL;
+	}
+	if (bytes > left) { return EINVAL; }
+	left -= bytes;
+	bt_links[handle].left = left;
+	bt_links[handle].cid = cid;
+	bt_buffers[slot].session = bt_session;
+	bt_buffers[slot].handle = handle;
+	bt_buffers[slot].busy = true;
+	uint8_t *td = (uint8_t *)(bt_protocol + 0x29a0 + w * 8);
+	hip_put16(td, bytes);
+	td[2] = slot;
+	td[3] = flags | (left == 0 ? 1 : 0);
+	hip_put16(td + 4, handle);
+	hip_put16(td + 6, cid);
+	memcpy((void *)(bt_protocol + 0x2aa0 + slot * BT_ACL_BYTES), h4 + 5, bytes);
+	__builtin_arm_dsb(0xf);
+	w32(bt_protocol, 0x2c, (w + 1) % BT_ACL_COUNT);
+	bt_acl_doorbell();
+	return 0;
+}
+
+/* Return TX credits only for buffers the firmware has actually freed. */
+static void
+bt_acl_reap(void)
+{
+	uint32_t r = r32(bt_protocol, 0x30), w = r32(bt_protocol, 0x64);
+	if (r >= BT_ACL_COUNT || w >= BT_ACL_COUNT || r == w) { return; }
+	__builtin_arm_dsb(0xf);
+	while (r != w) {
+		const uint8_t *td = (const uint8_t *)(bt_protocol + 0x16540 + r * 4);
+		unsigned slot = td[0];
+		uint16_t handle = hip_u16(td + 2) & 0xfff;
+		lck_mtx_lock(&scsc_bt_lock);
+		bool valid = slot < BT_ACL_BUFFERS && bt_buffers[slot].busy && bt_buffers[slot].handle == handle;
+		uint32_t session = bt_session;
+		uint32_t unit = valid && bt_buffers[slot].session == session ? bt_unit : 0;
+		lck_mtx_unlock(&scsc_bt_lock);
+		uint8_t h4[8] = {4, 0x13, 5, 1, (uint8_t)handle, (uint8_t)(handle >> 8), 1, 0};
+		if (unit != 0 && ctl_enqueuedata(bt_ctl, unit, h4, sizeof(h4), 0) != 0) { break; }
+		lck_mtx_lock(&scsc_bt_lock);
+		if (valid) { bt_buffers[slot].busy = false; }
+		r = (r + 1) % BT_ACL_COUNT;
+		w32(bt_protocol, 0x30, r);
+		lck_mtx_unlock(&scsc_bt_lock);
+	}
+	bt_acl_doorbell();
+}
+
+/* Deliver one fragment, holding the RX slot until its full payload is read. */
+static bool
+bt_acl_receive(unsigned *offset)
+{
+	uint32_t r = r32(bt_protocol, 0x34), w = r32(bt_protocol, 0x68);
+	if (r >= BT_ACL_COUNT || w >= BT_ACL_COUNT || r == w) { return false; }
+	__builtin_arm_dsb(0xf);
+	const uint8_t *td = (const uint8_t *)(bt_protocol + 0xe440 + r * 1032);
+	unsigned bytes = hip_u16(td + 2);
+	uint16_t handle = hip_u16(td);
+	lck_mtx_lock(&scsc_bt_lock);
+	uint32_t unit = bt_unit, session = bt_session;
+	if (unit == 0 || td[6] != 0 || bytes > BT_ACL_BYTES || handle >= BT_ACL_HANDLES || *offset > bytes) {
+		lck_mtx_unlock(&scsc_bt_lock);
+		goto consume;
+	}
+	bool flow = bt_host_flow;
+	if (flow && (bt_host_count == 0 || bt_host_used >= bt_host_count)) {
+		lck_mtx_unlock(&scsc_bt_lock);
+		return false;
+	}
+	unsigned chunk = bytes - *offset;
+	if (bt_host_mtu != 0 && chunk > bt_host_mtu) { chunk = bt_host_mtu; }
+	if (flow) { bt_host_used++; bt_links[handle].rx_credits++; }
+	lck_mtx_unlock(&scsc_bt_lock);
+	uint8_t h4[BT_ACL_BYTES + 5] = {2};
+	unsigned pb = *offset != 0 ? 1 : (td[5] & 3);
+	hip_put16(h4 + 1, handle | (pb << 12) | ((td[4] & 3) << 14));
+	hip_put16(h4 + 3, chunk);
+	memcpy(h4 + 5, td + 8 + *offset, chunk);
+	if (ctl_enqueuedata(bt_ctl, unit, h4, chunk + 5, 0) != 0) {
+		lck_mtx_lock(&scsc_bt_lock);
+		if (flow && session == bt_session) { bt_host_used--; bt_links[handle].rx_credits--; }
+		lck_mtx_unlock(&scsc_bt_lock);
+		return false;
+	}
+	*offset += chunk;
+	if (*offset < bytes) { return true; }
+consume:
+	*offset = 0;
+	w32(bt_protocol, 0x34, (r + 1) % BT_ACL_COUNT);
+	bt_acl_doorbell();
+	return true;
+}
+
+static errno_t
+scsc_bt_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sa, void **info)
+{
+	*info = NULL;
+	lck_mtx_lock(&scsc_bt_lock);
+	bt_unit = sa->sc_unit;
+	bt_session++;
+	bt_used = 0;
+	bt_reply_pending = false;
+	bt_vs_opcode = 0;
+	bt_vs_first = 0;
+	bt_host_mtu = bt_host_count = bt_host_used = 0;
+	bt_host_flow = false;
+	bt_reporting = 0;
+	memset(bt_links, 0, sizeof(bt_links));
+	lck_mtx_unlock(&scsc_bt_lock);
+	say("scsc-bt: iOS H4 client connected, unit %u pid %d\n", sa->sc_unit, proc_pid(current_proc()));
+	return 0;
+}
+
+static errno_t
+scsc_bt_disconnect(__unused kern_ctl_ref ref, uint32_t unit, __unused void *info)
+{
+	lck_mtx_lock(&scsc_bt_lock);
+	if (bt_unit == unit) { bt_unit = 0; bt_used = 0; }
+	lck_mtx_unlock(&scsc_bt_lock);
+	return 0;
+}
+
+static errno_t
+scsc_bt_send(__unused kern_ctl_ref ref, uint32_t unit, __unused void *info, mbuf_t m, __unused int flags)
+{
+	errno_t error = 0;
+	size_t length = mbuf_pkthdr_len(m);
+	lck_mtx_lock(&scsc_bt_lock);
+	if (bt_unit != unit || unit == 0) { error = ENXIO; }
+	for (size_t off = 0; error == 0 && off < length; off++) {
+		if (mbuf_copydata(m, off, 1, bt_fragment + bt_used) != 0) { error = EINVAL; break; }
+		bt_used++;
+		unsigned type = bt_fragment[0];
+		if (type != 1 && type != 2) { error = EOPNOTSUPP; break; }
+		if (type == 2 && bt_used >= 5) {
+			unsigned bytes = hip_u16(bt_fragment + 3);
+			if (bytes > BT_ACL_BYTES) { error = EMSGSIZE; break; }
+			if (bt_used == 5 + bytes) { error = bt_acl_send(bt_fragment, bt_used); bt_used = 0; }
+		} else if (type == 1 && bt_used >= 4 && bt_used == 4u + bt_fragment[3]) {
+			uint16_t opcode = hip_u16(bt_fragment + 1);
+			if (opcode == 0xfce2 || opcode == 0xfd1b) {
+				/* These two are synchronous: iOS matches the completion by the subopcode in
+				 * the command's first parameter, so remember it for the forged event. The
+				 * caller already holds scsc_bt_lock (this is not a recursive mutex). */
+				bt_vs_opcode = opcode;
+				bt_vs_first = bt_used >= 5 ? bt_fragment[4] : 0;
+			}
+			if (opcode == 0x0c31 || opcode == 0x0c33 || opcode == 0x0c35 || opcode == 0x0c5a || opcode == 0x0c5b) {
+				error = bt_host_command(bt_fragment + 1, bt_used - 1);
+			} else if (!bt_hci_send(bt_protocol, bt_mbox, bt_fragment + 1, bt_used - 1)) {
+				error = ENOBUFS;
+			}
+			if (bt_tx_said++ < 140) {
+				say("scsc-bt: iOS TX unit %u HCI %#x len %u errno %d\n", unit, opcode, bt_used - 1, error);
+			}
+			if (opcode == 0x200b && bt_used >= 11) {
+				/* The controller refuses LE Set Scan Enable (0x200c) with 0x12 for
+				 * iOS's 300 ms interval; its own probe scans at 60 ms / 30 ms and the
+				 * controller accepts that. Ask for those, from the public address (iOS
+				 * never sends LE Set Random Address for its own type 1). */
+				bt_fragment[5] = 0x60;
+				bt_fragment[6] = 0x00;
+				bt_fragment[7] = 0x30;
+				bt_fragment[8] = 0x00;
+				bt_fragment[9] = 0;
+				say("scsc-bt: LE scan parameters set to 60/30 ms from the public address\n");
+			}
+			if (opcode == 0x200b || opcode == 0x200c) {
+				/* The controller answers 0x12 (Invalid HCI Command Parameters) to the LE
+				 * scan enable: its parameters are what tell why. */
+				say("scsc-bt: LE cmd %#x:", opcode);
+				for (unsigned at = 3; at < bt_used; at++) { say(" %02x", bt_fragment[at]); }
+				say("\n");
+			}
+			bt_used = 0;
+		}
+	}
+	if (error != 0 && bt_unit == unit) { bt_used = 0; }
+	lck_mtx_unlock(&scsc_bt_lock);
+	mbuf_freem(m);
+	return error;
+}
+
+static errno_t
+scsc_bt_getopt(__unused kern_ctl_ref ref, __unused uint32_t unit, __unused void *info, int opt, void *data, size_t *len)
+{
+	if ((unsigned)opt != (unsigned)TIOCGETA) { return ENOPROTOOPT; }
+	if (data != NULL) {
+		if (*len < sizeof(struct termios)) { return EINVAL; }
+		struct termios t = { .c_cflag = CS8 | CREAD | CLOCAL | CRTSCTS, .c_ispeed = 4000000, .c_ospeed = 4000000 };
+		memcpy(data, &t, sizeof(t));
+	}
+	*len = sizeof(struct termios);
+	return 0;
+}
+
+static errno_t
+scsc_bt_setopt(__unused kern_ctl_ref ref, __unused uint32_t unit, __unused void *info, int opt,
+    __unused void *data, __unused size_t len)
+{
+	unsigned o = (unsigned)opt;
+	return o == (unsigned)TIOCSETA || o == (unsigned)TIOCSETAW || o == (unsigned)TIOCSETAF ? 0 : ENOPROTOOPT;
+}
+
+static void
+scsc_bt_events(__unused void *arg, __unused wait_result_t result)
+{
+	unsigned rx_offset = 0;
+	for (;;) {
+		uint8_t reply[sizeof(bt_reply)];
+		lck_mtx_lock(&scsc_bt_lock);
+		uint32_t owner = bt_unit, session = bt_session;
+		bool pending = bt_reply_pending && owner != 0;
+		unsigned reply_len = bt_reply_len;
+		if (pending) {
+			memcpy(reply, bt_reply, sizeof(reply));
+			bt_reply_pending = false;
+		}
+		lck_mtx_unlock(&scsc_bt_lock);
+		if (pending && ctl_enqueuedata(bt_ctl, owner, reply, reply_len, 0) != 0) {
+			lck_mtx_lock(&scsc_bt_lock);
+			if (bt_session == session && !bt_reply_pending) {
+				memcpy(bt_reply, reply, sizeof(reply));
+				bt_reply_len = reply_len;
+				bt_reply_pending = true;
+			}
+			lck_mtx_unlock(&scsc_bt_lock);
+		}
+		for (unsigned budget = 0; budget < BT_EVT_COUNT; budget++) {
+			uint8_t h4[259] = {4};
+			uint32_t index, unit;
+			int n = bt_hci_peek(bt_protocol, h4 + 1, &index);
+			if (n == -1) {
+				say("scsc-bt: iOS transport invalid event index\n");
+				thread_terminate(current_thread());
+				return;
+			}
+			if (n == 0) { break; }
+			lck_mtx_lock(&scsc_bt_lock);
+			unit = bt_unit;
+			lck_mtx_unlock(&scsc_bt_lock);
+			if (n > 0 && unit != 0) {
+				/* Broadcom vendor commands the SCSC firmware does not know come back as
+				 * Command Status (Unknown Command). iOS's BCM VSC event parser
+				 * (bcm_vsc.c) rejects a completion with fewer than two bytes after the
+				 * status ("Invalid data size %d") and then times the command out, which
+				 * aborts the whole stack. Complete such a command here as a Command
+				 * Complete with the same status and two zero bytes, so its callback
+				 * finishes; the opcode is echoed so the stack matches it. */
+				uint16_t vendor = n == 6 && h4[1] == 0x0f ? hip_u16(h4 + 5) :
+				    n == 7 && h4[1] == 0x0e ? hip_u16(h4 + 4) : 0;
+				if (vendor == 0xfce2 || vendor == 0xfd1b) {
+					uint8_t first;
+					lck_mtx_lock(&scsc_bt_lock);
+					first = bt_vs_opcode == vendor ? bt_vs_first : 0;
+					lck_mtx_unlock(&scsc_bt_lock);
+					if (n == 6 && h4[1] == 0x0f && h4[3] == 1) {
+						uint8_t response[] = {4, 0x0e, 6, 1, h4[5], h4[6], 1, first, 0};
+						memcpy(h4, response, sizeof(response));
+						n = sizeof(response) - 1;
+					} else if (n == 7 && h4[1] == 0x0e && h4[6] != 0) {
+						uint8_t response[] = {4, 0x0e, 6, 1, h4[4], h4[5], h4[6], first, 0};
+						memcpy(h4, response, sizeof(response));
+						n = sizeof(response) - 1;
+					}
+				}
+				if (n == 70 && h4[1] == 0x0e && hip_u16(h4 + 4) == 0x1002 && h4[6] == 0) {
+					/* The local H4 layer implements these two configuration commands. */
+					h4[7 + 18] |= 0x0c;
+				}
+				if (n == 6 && h4[1] == 0x0e && hip_u16(h4 + 4) == 0x0c03 && h4[6] == 0) {
+					lck_mtx_lock(&scsc_bt_lock);
+					bt_reporting = 0;
+					bt_host_flow = false;
+					bt_host_used = bt_host_mtu = bt_host_count = 0;
+					memset(bt_links, 0, sizeof(bt_links));
+					lck_mtx_unlock(&scsc_bt_lock);
+				}
+				errno_t err = ctl_enqueuedata(bt_ctl, unit, h4, (size_t)n + 1, 0);
+				if (err != 0) {
+					if (bt_backpressure_said++ < 8) { say("scsc-bt: iOS H4 enqueue error %d unit %u\n", err, unit); }
+					break;
+				}
+				if (bt_rx_said++ < 140) {
+					unsigned opcode = n >= 6 && h4[1] == 0x0e ? hip_u16(h4 + 4) : n == 6 && h4[1] == 0x0f ? hip_u16(h4 + 5) : 0;
+					unsigned status = h4[1] == 0x0e && n >= 6 ? h4[6] : h4[1] == 0x0f && n == 6 ? h4[3] : 0;
+					say("scsc-bt: iOS RX unit %u event %#x HCI %#x status %#x\n", unit, h4[1], opcode, status);
+				}
+			}
+			bt_hci_pop(bt_protocol, bt_mbox, index);
+		}
+		bt_acl_reap();
+		for (unsigned budget = 0; budget < BT_ACL_COUNT && bt_acl_receive(&rx_offset); budget++) {}
+		assert_wait_timeout((event_t)&bt_ctl, THREAD_UNINT, 5, NSEC_PER_MSEC);
+		thread_block(THREAD_CONTINUE_NULL);
+	}
+}
+
+static bool
+scsc_bt_publish(vm_offset_t protocol, vm_offset_t mbox, const uint8_t address[6])
+{
+	struct kern_ctl_reg reg = {0};
+	thread_t worker;
+	if (r32(protocol, 0x50) & 2u) {
+		say("scsc-bt: ACL transport requires R4 foreground interrupts\n");
+		return false;
+	}
+	bt_protocol = protocol;
+	bt_mbox = mbox;
+	strlcpy(reg.ctl_name, "com.apple.uart.bluetooth", sizeof(reg.ctl_name));
+	reg.ctl_flags = CTL_FLAG_REG_SOCK_STREAM;
+	reg.ctl_recvsize = 64 * 1024;
+	reg.ctl_connect = scsc_bt_connect;
+	reg.ctl_disconnect = scsc_bt_disconnect;
+	reg.ctl_send = scsc_bt_send;
+	reg.ctl_getopt = scsc_bt_getopt;
+	reg.ctl_setopt = scsc_bt_setopt;
+	errno_t err = ctl_register(&reg, &bt_ctl);
+	if (err != 0) { say("scsc-bt: H4 control registration failed %d\n", err); return false; }
+	if (kernel_thread_start(scsc_bt_events, NULL, &worker) != KERN_SUCCESS) {
+		(void)ctl_deregister(bt_ctl);
+		return false;
+	}
+	thread_deallocate(worker);
+	HakiosBTNodeStart(address, 4000000);
+	say("scsc-bt: iOS H4 command/event/ACL transport published\n");
+	return true;
+}
+#endif
+
+static void
+scsc_bt_probe(vm_offset_t mem, vm_offset_t mbox, uint32_t panic_off, bool bridge)
+{
+	uint64_t config_size = 0;
+	const uint8_t *config = hakios_image_file("fw", "mx140_bt.hcf", &config_size, NULL);
+	uint32_t start = (heap_next + 63) & ~63u;
+
+	if (!wlan_started || config == NULL || config_size == 0 || config_size > 4096 ||
+	    start > SHARED_BYTES - BT_PROTOCOL_SIZE - 4096 - 128) {
+		say("scsc-bt: skipped, WLAN %u, BT HCF size %llu, heap +%#x\n", wlan_started, config_size, start);
+		return;
+	}
+	if (!guard_enter(7)) {
+		return;
+	}
+	uint32_t bhcs = heap_alloc(mem, 28, 0);
+	uint32_t proto = heap_alloc(mem, BT_PROTOCOL_SIZE, 0);
+	uint32_t conf = heap_alloc(mem, (uint32_t)config_size, 0);
+	uint8_t *b = (uint8_t *)(mem + bhcs), *p = (uint8_t *)(mem + proto);
+	vm_offset_t protocol = mem + proto;
+	/* BT consumes the complete HCF, unlike the WLAN MIB record area. */
+	memcpy((void *)(mem + conf), config, (size_t)config_size);
+	hip_put32(b, 2);
+	hip_put32(b + 4, proto);
+	hip_put32(b + 8, BT_PROTOCOL_SIZE);
+	hip_put32(b + 12, conf);
+	hip_put32(b + 16, (uint32_t)config_size);
+	/* Diagnostic local address. The probe neither advertises nor connects. */
+	hip_put32(b + 20, 2);
+	hip_put16(b + 26, 0x0250);
+	hip_put32(p, BT_PROTOCOL_MAGIC);
+	hip_put16(p + 0x04, 2);                /* AP -> M4 foreground */
+	hip_put16(p + 0x14, BT_R4_BG);         /* AP -> R4 background */
+	hip_put16(p + 0x16, 7);                /* AP -> R4 foreground */
+	hip_put16(p + 0x18, 8);                /* to AP, background */
+	hip_put16(p + 0x1a, 9);                /* to AP, foreground */
+	hip_put16(p + 0xbc, 8);                /* AP -> R4 info */
+	hip_put16(p + 0xbe, 10);               /* to AP, info */
+	__builtin_arm_dsb(0xf);
+	say("scsc-bt: START_REQ BHCS +%#x, BSMHCP +%#x, HCF %llu bytes\n", bhcs, proto, config_size);
+	if (!bt_service_request(mem, mbox, 0, bhcs)) {
+		say("scsc-bt: START_CFM timed out\n");
+		goto out;
+	}
+	say("scsc-bt: START_CFM, controller flags %#x, features %#x\n", r32(protocol, 0x4c), r32(protocol, 0x50));
+	static const uint8_t reset[] = {0x03, 0x0c, 0}, read_address[] = {0x09, 0x10, 0};
+	uint8_t address[6] = {0};
+	if (bt_hci_command(protocol, mbox, reset, sizeof(reset), NULL) && bridge) {
+		bool scan_ok = bt_ble_probe(protocol, mbox);
+		if (scan_ok && bt_hci_command(protocol, mbox, reset, sizeof(reset), NULL) &&
+		    bt_hci_command(protocol, mbox, read_address, sizeof(read_address), address) &&
+		    (address[0] || address[1] || address[2] || address[3] || address[4] || address[5])) {
+#ifdef HAKIOS_BCM4361_BT
+			if (scsc_bt_publish(protocol, mbox, address)) { goto out; }
+#else
+			say("scsc-bt: iOS bridge requires the existing BT registry helper (HAKIOS_BCM4361_BT)\n");
+#endif
+		}
+	}
+	say("scsc-bt: STOP_CFM %s\n", bt_service_request(mem, mbox, 2, 0) ? "received" : "timed out");
+out:
+	guard_leave();
+	log_dump(mem, panic_off);
+}
+
 static void
 scsc_start(uint32_t steps)
 {
@@ -3030,6 +3711,9 @@ scsc_start(uint32_t steps)
 		    (r32(gicd, 0x200 + 4 * (CFG_REQ_INTID / 32)) >> (CFG_REQ_INTID % 32)) & 1, r32(mbox, INTSR0), r32(mbox, INTSR1),
 		    r32(mbox, ISSR(0)), r32(mbox, ISSR(1)), r32(mbox, ISSR(2)), r32(mbox, ISSR(3)), r32(mbox, ISSR(4)),
 		    r32(mbox, ISSR(5)), r32(mbox, ISSR(6)), r32(mbox, ISSR(7)), panic[0], panic[1], panic[2], panic[3]);
+	}
+	if (steps == 7 || steps == 8) {
+		scsc_bt_probe(mem, mbox, panic_off, steps == 8);
 	}
 	if (steps >= 6) {
 		hip_station(mem, mbox, panic_off);		/* does not return: it keeps the queues */

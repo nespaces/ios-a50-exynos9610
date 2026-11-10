@@ -160,7 +160,7 @@
 #include <sys/hakios.audio.h>
 #include <sys/hakios.exynos_abox.h>
 #include <sys/hakios.exynos_acpm.h>
-#if CONFIG_HAKIOS_RT5665
+#ifdef HAKIOS_RT5665
 #include <sys/hakios.rt5665.h>
 #else
 static void hakios_rt5665_capture(bool on) { (void)on; }
@@ -1378,7 +1378,7 @@ stream_run(uint64_t tone_until_us, uint64_t until_us)
 				if (hakios_audio_volume(&below, &m, &generation)) {
 					if (m != muted) {
 						muted = m;
-						say("abox: 8: iOS %s\n", muted ? "mutes: the amplifiers stay off" : "unmutes");
+						say("abox: 8: iOS %s\n", muted ? "mutes (samples; TFA stays if they play)" : "unmutes");
 					}
 					if (below != sink_below) {
 						sink_below = below;
@@ -1387,15 +1387,15 @@ stream_run(uint64_t tone_until_us, uint64_t until_us)
 					}
 				}
 			}
-			if (amp_running == NULL && !amp_given_up && !muted && !hp_on && sounded != 0 && since < 100000) {
+			if (amp_running == NULL && !amp_given_up && !hp_on && sounded != 0 && since < 100000) {
 				if (amp_hook != NULL) {
 					say("abox: 8: iOS plays: starting the amplifiers\n");
 				}
 				sink_peak = 0;
 				amps_start();
-			} else if (amp_running != NULL && (muted || hp_on || since > QUIET_STOP_US)) {
+			} else if (amp_running != NULL && (hp_on || since > QUIET_STOP_US)) {
 				say("abox: 8: %s: stopping the amplifiers; what iOS wrote peaked at %u of 32768\n",
-				    muted ? "muted" : hp_on ? "the headphones have the sound" : "three seconds of silence", sink_peak);
+				    hp_on ? "the headphones have the sound" : "three seconds of silence", sink_peak);
 				guard_say();
 				amps_stop();
 			}
@@ -1819,6 +1819,13 @@ static uint64_t live_frames, live_squares, live_began_us, live_said_us;
 static uint32_t live_peak, live_zeroes, live_count;
 static int16_t live_mono[REC_PERIOD_BYTES / FRAME_BYTES];
 
+static void
+rt5665_live_thread(__unused void *arg, __unused wait_result_t result)
+{
+	hakios_rt5665_capture(true);
+	thread_terminate(current_thread());
+}
+
 static bool
 live_start(void)
 {
@@ -1836,7 +1843,12 @@ live_start(void)
 	(void)poke_bits(&abox, "UAIF0_CTRL0 (MIC_ENABLE)", ABOX_UAIF_CTRL0(0), UAIF_MIC_ENABLE, UAIF_MIC_ENABLE);
 	uaif0_on = true;
 	if (soc9610) {
-		hakios_rt5665_capture(true);
+		thread_t codec;
+
+		/* I2C and VREF waits must not sit on RDMA0's feeder: that stalled the TFA and killed playback. */
+		if (kernel_thread_start(rt5665_live_thread, NULL, &codec) == KERN_SUCCESS) {
+			thread_deallocate(codec);
+		}
 	}
 	if (!wait_bits(&abox, W1(RDMA_STATUS), RDMA_PROGRESS, RDMA_PROGRESS, 2000, &took)) {
 		say("abox: mic: WDMA1 has not started after %llu us (STATUS %#x, CTRL0 %#x, UAIF0 STATUS %#x): no microphone until iOS "
