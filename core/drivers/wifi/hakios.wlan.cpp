@@ -37,10 +37,15 @@
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
+
+#ifndef kIOMessageServicePropertyChange
+#define kIOMessageServicePropertyChange  ((unsigned)0xe00001d0) /* iokit_common_msg(0x1d0) */
+#endif
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSNumber.h>
 
 extern "C" void HakiosWLANStart(const char * interface, const uint8_t * address);
+extern "C" void HakiosWLANSetLink(bool up);
 
 class IONetworkController : public IOService
 {
@@ -70,7 +75,21 @@ class IONetworkInterface : public IOService
 
 OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
 
-class HakiosWLAN : public IONetworkInterface
+class IOEthernetInterface : public IONetworkInterface
+{
+	OSDeclareDefaultStructors(IOEthernetInterface);
+};
+
+OSDefineMetaClassAndStructors(IOEthernetInterface, IONetworkInterface);
+
+class IO80211Interface : public IOEthernetInterface
+{
+	OSDeclareDefaultStructors(IO80211Interface);
+};
+
+OSDefineMetaClassAndStructors(IO80211Interface, IOEthernetInterface);
+
+class HakiosWLAN : public IO80211Interface
 {
 	OSDeclareDefaultStructors(HakiosWLAN);
 
@@ -79,7 +98,7 @@ public:
 	    IOUserClient ** handler) APPLE_KEXT_OVERRIDE;
 };
 
-OSDefineMetaClassAndStructors(HakiosWLAN, IONetworkInterface);
+OSDefineMetaClassAndStructors(HakiosWLAN, IO80211Interface);
 
 /* There is none (see the top); that somebody asked shows that the service was found. */
 IOReturn
@@ -109,6 +128,48 @@ publish(IOService * service, IOService * provider, const char * name)
 	}
 	service->registerService();
 	return service;
+}
+
+static IO80211Controller * g_controller;
+static HakiosWLAN * g_wlan;
+
+/*
+ * configd only starts DHCP for an IONetworkInterface whose controller reports an active link
+ * (hakios.wlan.cpp header: "failed to become routable interface"). BSD IFF_UP alone is not enough:
+ * scsc20 had link up, RX, and no TX at all.
+ */
+extern "C" boolean_t ml_get_interrupts_enabled(void);
+
+void
+HakiosWLANSetLink(bool up)
+{
+	UInt32 status = up ? 0x1u | 0x2u : 0x1u;        /* kIONetworkLinkValid | Active */
+	OSNumber * number;
+	bool notify;
+
+	/*
+	 * scsc21 panicked on the way back to the loader: "Console I/O from interrupt-disabled context"
+	 * (serial_console.c:168) from IOLog/messageClients here. setProperty only; notify when IRQs are on.
+	 */
+	/* setProperty/messageClients also print; skip the whole update if IRQs are off (loader return). */
+	if (ml_get_interrupts_enabled() == 0) {
+		return;
+	}
+	notify = true;
+	if (g_controller != NULL && (number = OSNumber::withNumber((unsigned long long) status, 32)) != NULL) {
+		g_controller->setProperty("IOLinkStatus", number);
+		number->release();
+		if (notify) {
+			g_controller->messageClients(kIOMessageServicePropertyChange);
+		}
+	}
+	if (g_wlan != NULL && (number = OSNumber::withNumber(up ? 1ull : 0ull, 32)) != NULL) {
+		g_wlan->setProperty("IOInterfaceState", number);
+		number->release();
+		if (notify) {
+			g_wlan->messageClients(kIOMessageServicePropertyChange);
+		}
+	}
 }
 
 /* Once, when the interface of a radio exists. */
@@ -147,11 +208,12 @@ HakiosWLANStart(const char * interface, const uint8_t * address)
 		IOLog("HakiosWLAN: the controller did not start\n");
 		return;
 	}
+	g_controller = controller;
 
 	wlan->setProperty("IOInterfaceName", interface);
 	wlan->setProperty("BSD Name", interface);
 	wlan->setProperty("IOInterfaceNamePrefix", "en");
-	if ((number = OSNumber::withNumber(6ULL, 32)) != NULL) {        /* IFT_ETHER */
+	if ((number = OSNumber::withNumber(0x47ULL, 32)) != NULL) {     /* IFT_IEEE80211: configd's Wi-Fi, not Ethernet */
 		wlan->setProperty("IOInterfaceType", number);
 		number->release();
 	}
@@ -159,12 +221,33 @@ HakiosWLANStart(const char * interface, const uint8_t * address)
 		wlan->setProperty("IOInterfaceUnit", number);
 		number->release();
 	}
+	if ((number = OSNumber::withNumber(1500ULL, 32)) != NULL) {
+		wlan->setProperty("IOMaxTransferUnit", number);
+		number->release();
+	}
+	if ((number = OSNumber::withNumber(6ULL, 32)) != NULL) {
+		wlan->setProperty("IOMediaAddressLength", number);
+		number->release();
+	}
+	if ((number = OSNumber::withNumber(14ULL, 32)) != NULL) {
+		wlan->setProperty("IOMediaHeaderLength", number);
+		number->release();
+	}
 	wlan->setProperty("IOBuiltin", true);
 	wlan->setProperty("IOPrimaryInterface", true);
 	wlan->setProperty("IO80211InterfaceRole", "Infrastructure");
-	if (publish(wlan, controller, "HakiosWLAN") == NULL) {
+	{
+		OSDictionary * data = OSDictionary::withCapacity(1);
+
+		if (data != NULL) {
+			wlan->setProperty("IONetworkData", data);
+			data->release();
+		}
+	}
+	if (publish(wlan, controller, interface) == NULL) {             /* registry name en0, as IONetworkingFamily */
 		IOLog("HakiosWLAN: the service did not start\n");
 	} else {
+		g_wlan = wlan;
 		wlan->release();
 	}
 	controller->release();

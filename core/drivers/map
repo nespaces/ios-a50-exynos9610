@@ -59,6 +59,7 @@ audio    bsd/dev/hakios.exynos_abox.c
 audio    bsd/dev/hakios.max98512.c
 audio    bsd/dev/hakios.cs47l93.c
 audio    bsd/dev/hakios.tfa9872.c
+audio    bsd/dev/hakios.rt5665.c
 
 power    bsd/dev/hakios.battery.c
 power    iokit/Kernel/hakios.battery.cpp
@@ -72,6 +73,9 @@ power    bsd/dev/hakios.cpufreq.c
 
 wifi     bsd/dev/hakios.wifi.c
 wifi     bsd/dev/hakios.wlfw.c
+wifi     bsd/dev/hakios.scsc.c
+wifi     bsd/dev/hakios.lx_wpa.c
+wifi     bsd/dev/hakios.lx_wpa.h
 wifi     bsd/dev/hakios.lx.c
 wifi     bsd/dev/hakios.sta.c
 wifi     bsd/dev/hakios.apple80211.c

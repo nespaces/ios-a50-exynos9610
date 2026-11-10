@@ -23,7 +23,8 @@ This is an independent hobby integration. It is not affiliated with or endorsed 
 | Sound | speaker: ABOX (CPU off) → UAIF2 → NXP TFA9872 (`abox=8 tfa9872=3`), volume from iOS |
 | Brightness | EA8076 panel via DSIM0 DCS 51, from Settings and Control Center |
 | Vibration | the motor via its GPIO-switched LDO (`vib=1`) |
-| Not yet | Wi-Fi (Samsung SCSC S620, a driver of its own), camera (and so the flashlight), ringtones (AAC), modem |
+| Wi-Fi | Samsung SCSC S620 (Maxwell `mx140`), a driver of its own (`drivers/wifi/hakios.scsc.c`, `scsc=6`): the chip powered and booted, HIP4, scan, WPA2 join from Settings, DHCP, TCP over it (Safari loads, slowly); Settings does not show the address yet |
+| Not yet | Bluetooth (the same chip), microphone (RT5665, in progress), camera (and so the flashlight), ringtones (AAC), Metal in apps (Notes' drawing), modem |
 
 ## Building
 

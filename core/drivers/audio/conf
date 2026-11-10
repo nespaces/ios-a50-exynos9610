@@ -66,3 +66,8 @@ driver TFA9872
 	help    the Galaxy A50's speaker amplifier, an NXP TFA9872 on I2C_CMGP00, fed by ABOX's UAIF2 (tfa9872=N: 1 a look,
 	help    2 set up from the phone's Tfa9872.cnt and powered down, 3 turned on and off by UAIF2's start and stop;
 	help    with abox=8 abox_soc=9610)
+
+driver RT5665
+	file    bsd/dev/hakios.rt5665.c
+	help    the Galaxy A50's audio codec, a Realtek RT5665 at 0x1b on i2c_6 (rt5665=N: 1 a look, 2 ID, 3 MAINMIC IN3
+	help    and AIF1 a slave of ABOX UAIF0; with abox=8 abox_mic=1)

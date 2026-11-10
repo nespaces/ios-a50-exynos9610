@@ -42,6 +42,8 @@ static void
 say(NSString * text)
 {
 	NSLog(@"HakiosMetal: %@", text);
+	/* (and to standard error: an application's os_log does not reach the run's log, its stderr may -- inject_app.c) */
+	fprintf(stderr, "HakiosMetal[%s]: %s\n", getprogname(), [text UTF8String]);
 }
 
 /* -initWithAcceleratorPort: the fifth step of how Metal finds a device. */
@@ -770,6 +772,7 @@ libraryNewFunction(id self, __unused SEL _cmd, id name)
 			return function;
 		}
 	}
+	say([NSString stringWithFormat:@"newFunctionWithName:%@: not among the library's %u functions: nil", name, l->info.count]);
 	return nil;
 }
 

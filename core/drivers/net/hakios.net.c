@@ -43,6 +43,7 @@
 #include <sys/systm.h>
 
 extern void HakiosWLANStart(const char *interface, const uint8_t *address);  /* drivers/wifi/hakios.wlan.cpp */
+extern void HakiosWLANSetLink(bool up);
 
 static LCK_GRP_DECLARE(net_lck_grp, "hakios-net");
 
@@ -458,6 +459,8 @@ net_output(ifnet_t ifp, mbuf_t packet)
 		lck_mtx_lock(&n->tx_lock);
 		sent = n->link->transmit(packet, length);
 		lck_mtx_unlock(&n->tx_lock);
+	} else if (n->count.dropped_out < 8) {
+		printf("net: en%u drop TX %zu bytes (link %s)\n", n->unit, length, n->up ? "up" : "down");
 	}
 	if (sent) {
 		if (n->unit == 0) {
@@ -549,7 +552,14 @@ net_ioctl(ifnet_t ifp, u_long command, void *data)
 		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
 		break;
 	case SIOCSIFFLAGS:
-		/* running whenever it is up: the link is there or it is not, nothing is switched on */
+		/*
+		 * configd's IPConfiguration (net_test dhcp en0, scsc26) sent this with data == NULL:
+		 * FAR 0x10 is ifr_flags. A null request is EFAULT; IFF_UP already follows the link.
+		 */
+		if (request == NULL) {
+			break;
+		}
+		ifnet_set_flags(ifp, request->ifr_flags, IFF_UP);
 		ifnet_set_flags(ifp, (ifnet_flags(ifp) & IFF_UP) ? IFF_RUNNING : 0, IFF_RUNNING);
 		break;
 	case SIOCGIFMEDIA32:
@@ -612,8 +622,12 @@ hakios_net_link_state_unit(unsigned unit, bool up)
 		return;
 	}
 	n->up = up;
+	ifnet_set_flags(n->ifp, up ? (IFF_UP | IFF_RUNNING) : 0, IFF_UP | IFF_RUNNING);
 	printf("net: en%u's link (%s) is %s\n", n->unit, n->link->name, up ? "up" : "down");
 	net_link_event(n->ifp, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF);
+	if (n->link->wireless) {
+		HakiosWLANSetLink(up);
+	}
 }
 
 void
@@ -665,7 +679,7 @@ hakios_net_attach(const struct hakios_net_link *link)
 		.softc = n,
 		.family = IFNET_FAMILY_ETHERNET,
 		.subfamily = link->wireless ? IFNET_SUBFAMILY_WIFI : IFNET_SUBFAMILY_ANY,
-		.type = IFT_ETHER,
+		.type = IFT_ETHER,              /* 0x47 IEEE80211 on scsc34: DHCP did not complete; keep Ethernet framing */
 		.output = net_output,
 		.demux = ether_demux,
 		.add_proto = ether_add_proto,
@@ -702,7 +716,7 @@ hakios_net_attach(const struct hakios_net_link *link)
 	}
 	ifnet_set_capabilities_enabled(ifp, 0, -1);
 	ifnet_set_addrlen(ifp, ETHER_ADDR_LEN);
-	ifnet_set_baudrate(ifp, 100 * 1000 * 1000);
+	ifnet_set_baudrate(ifp, link->wireless ? 72ull * 1000 * 1000 : 100ull * 1000 * 1000);
 	ifnet_set_mtu(ifp, ETHERMTU);
 	ifnet_set_flags(ifp, IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX, 0xffff);
 	ifnet_set_hdrlen(ifp, ETHER_HDR_LEN);

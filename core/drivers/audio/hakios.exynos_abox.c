@@ -160,6 +160,11 @@
 #include <sys/hakios.audio.h>
 #include <sys/hakios.exynos_abox.h>
 #include <sys/hakios.exynos_acpm.h>
+#if CONFIG_HAKIOS_RT5665
+#include <sys/hakios.rt5665.h>
+#else
+static void hakios_rt5665_capture(bool on) { (void)on; }
+#endif
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
 
@@ -1456,8 +1461,9 @@ step_sink(void)
 	}
 	hakios_audio_set_sink("ABOX: RDMA0 -> UAIF1 -> the speakers", abox_sink);
 	say("abox: 8: /dev/hakios-audio plays through ABOX; the amplifiers start when iOS plays\n");
-	if (mic_for_ios && hakios_audio_input_create("the Galaxy S9's main microphone (the codec's IN3L) through ABOX's UAIF0 and "
-	    "WDMA1, while iOS listens (abox_mic=1)")) {
+	if (mic_for_ios && hakios_audio_input_create(soc9610 ?
+	    "the Galaxy A50's main microphone (RT5665 IN3) through ABOX's UAIF0 and WDMA1 (abox_mic=1)" :
+	    "the Galaxy S9's main microphone (the codec's IN3L) through ABOX's UAIF0 and WDMA1, while iOS listens (abox_mic=1)")) {
 		say("abox: 8: /dev/hakios-mic: the codec's microphone, recorded through WDMA1 whenever iOS listens\n");
 	}
 	(void)stream_run(0, 0);
@@ -1602,6 +1608,12 @@ uaif0_prepare(void)
 	qch_on("QCH ABOX_BCLK0 (UAIF0's bclk_gate)", CMU_QCH_BCLK0);
 	(void)poke_bits(&gpio, "gpb0 CON (UAIF0)", GPIO_GPB0 + GPIO_CON, UAIF0_PINS_MASK, UAIF0_PINS_FUNC);
 	(void)poke_bits(&gpio, "gpb0 PUD", GPIO_GPB0 + GPIO_PUD, UAIF0_PINS_MASK, UAIF0_PINS_PUD);
+	if (soc9610) {
+		/* aud-codec-mclk: gpb0-0 function 2; CMU_DISPAUD gate AUD_CODEC_MCLK +0x2058 bits 21/20 */
+		(void)poke_bits(&gpio, "gpb0-0 CON (codec MCLK)", GPIO_GPB0 + GPIO_CON, 0xFu, 2u);
+		(void)poke_bits(&gpio, "gpb0-0 PUD", GPIO_GPB0 + GPIO_PUD, 0xFu, 1u);
+		(void)poke_bits(&cmu, "GAT AUD_CODEC_MCLK", 0x2058, (1u << 21) | (1u << 20), (1u << 21) | (1u << 20));
+	}
 	rec_pins_set = true;
 	(void)poke_bits(&pmu, "PAD_RETENTION_ABOX_OPTION", PMU_PAD_RETENTION_ABOX, PMU_PAD_RELEASE, PMU_PAD_RELEASE);
 	(void)poke_bits(&pmu, "GPIO_MODE_ABOX_SYS_PWR_REG", PMU_GPIO_MODE_ABOX, 1, 1);
@@ -1823,6 +1835,9 @@ live_start(void)
 	wdma_on = true;
 	(void)poke_bits(&abox, "UAIF0_CTRL0 (MIC_ENABLE)", ABOX_UAIF_CTRL0(0), UAIF_MIC_ENABLE, UAIF_MIC_ENABLE);
 	uaif0_on = true;
+	if (soc9610) {
+		hakios_rt5665_capture(true);
+	}
 	if (!wait_bits(&abox, W1(RDMA_STATUS), RDMA_PROGRESS, RDMA_PROGRESS, 2000, &took)) {
 		say("abox: mic: WDMA1 has not started after %llu us (STATUS %#x, CTRL0 %#x, UAIF0 STATUS %#x): no microphone until iOS "
 		    "opens it again\n", took, rd(&abox, W1(RDMA_STATUS)), rd(&abox, W1(RDMA_CTRL0)), rd(&abox, ABOX_UAIF_STATUS(0)));

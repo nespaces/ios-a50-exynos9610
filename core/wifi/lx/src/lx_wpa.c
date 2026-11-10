@@ -17,7 +17,11 @@
 #include <string.h>
 #endif
 
+#ifdef _KERNEL
+#include "hakios.lx_wpa.h"		/* drivers/map gives the header the kernel's required name */
+#else
 #include "lx_wpa.h"
+#endif
 
 /* ---- SHA-1 ------------------------------------------------------------------------------------ */
 

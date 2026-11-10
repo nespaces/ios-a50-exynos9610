@@ -62,6 +62,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <notify.h>
 
 /* not in the Darwin SDK's headers, in the libraries all the same */
 extern mach_port_t bootstrap_port;
@@ -70,6 +71,7 @@ typedef const struct __SCDynamicStore *SCDynamicStoreRef;
 extern SCDynamicStoreRef SCDynamicStoreCreate(CFAllocatorRef allocator, CFStringRef name, void *callout, void *context);
 extern CFArrayRef SCDynamicStoreCopyKeyList(SCDynamicStoreRef store, CFStringRef pattern);
 extern CFPropertyListRef SCDynamicStoreCopyValue(SCDynamicStoreRef store, CFStringRef key);
+extern Boolean SCDynamicStoreSetValue(SCDynamicStoreRef store, CFStringRef key, CFPropertyListRef value);
 extern Boolean SCDynamicStoreSetNotificationKeys(SCDynamicStoreRef store, CFArrayRef keys, CFArrayRef patterns);
 extern CFRunLoopSourceRef SCDynamicStoreCreateRunLoopSource(CFAllocatorRef allocator, SCDynamicStoreRef store, CFIndex order);
 
@@ -188,7 +190,7 @@ struct set_reply {
 };
 #pragma pack(pop)
 
-static void
+static NSString *
 dhcp(const char *interface)
 {
 	static const char *const statuses[] = { "done", "permission denied", "no such interface", "invalid parameter",
@@ -205,7 +207,7 @@ dhcp(const char *interface)
 	result = bootstrap_look_up(bootstrap_port, "com.apple.network.IPConfiguration", &server);
 	if (result != KERN_SUCCESS) {
 		printf("net_test: dhcp: configd's IPConfiguration is not there: %#x\n", result);
-		return;
+		return nil;
 	}
 	memset(&message, 0, sizeof(message));
 	message.request.head.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE);
@@ -226,15 +228,83 @@ dhcp(const char *interface)
 	    MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
 	if (result != KERN_SUCCESS) {
 		printf("net_test: dhcp: the message did not go through: %#x\n", result);
-	} else if (message.reply.result != KERN_SUCCESS) {
+		return nil;
+	}
+	if (message.reply.result != KERN_SUCCESS) {
 		printf("net_test: dhcp: IPConfiguration does not take the message: %d\n", message.reply.result);
-	} else {
+		return nil;
+	}
+	{
 		int status = message.reply.status;
 
 		message.reply.service[sizeof(message.reply.service) - 1] = 0;
 		printf("net_test: dhcp: IPConfiguration says of \"setservice %s DHCP\": %d (%s), service %s\n", interface, status,
 		    status >= 0 && status < 8 ? statuses[status] : "?", message.reply.service);
+		return status == 0 && message.reply.service[0] != 0 ? @(message.reply.service) : nil;
 	}
+}
+
+/*
+ * wifid / Settings only tick Wi-Fi when IPv4 sits on a service whose Interface is AirPort/IEEE80211
+ * (net_test.m header). IPConfiguration's setservice makes a nameless one; publish the keys they read.
+ */
+static void
+wifi_publish(NSString *service)
+{
+	struct ifaddrs *list = NULL, *a;
+	char addr[64] = "", mask[64] = "", router[64] = "192.168.1.1";
+	unsigned o1 = 0, o2 = 0, o3 = 0, o4 = 0;
+	SCDynamicStoreRef store;
+	NSString *sid;
+	Boolean ok;
+
+	if (getifaddrs(&list) == 0) {
+		for (a = list; a != NULL; a = a->ifa_next) {
+			if (a->ifa_addr != NULL && a->ifa_addr->sa_family == AF_INET && strcmp(a->ifa_name, "en0") == 0) {
+				inet_ntop(AF_INET, &((struct sockaddr_in *)a->ifa_addr)->sin_addr, addr, sizeof(addr));
+				if (a->ifa_netmask != NULL) {
+					inet_ntop(AF_INET, &((struct sockaddr_in *)a->ifa_netmask)->sin_addr, mask, sizeof(mask));
+				}
+			}
+		}
+		freeifaddrs(list);
+	}
+	if (addr[0] == 0) {
+		printf("net_test: wifi: no inet on en0 to publish\n");
+		return;
+	}
+	if (sscanf(addr, "%u.%u.%u.%u", &o1, &o2, &o3, &o4) == 4) {
+		snprintf(router, sizeof(router), "%u.%u.%u.1", o1, o2, o3);
+	}
+	sid = service.length ? service : [[NSUUID UUID] UUIDString];
+	store = SCDynamicStoreCreate(NULL, CFSTR("net_test"), NULL, NULL);
+	if (store == NULL) {
+		printf("net_test: wifi: no SCDynamicStore to publish\n");
+		return;
+	}
+	{
+		NSDictionary *iface = @{ @"DeviceName": @"en0", @"Hardware": @"AirPort", @"Type": @"IEEE80211",
+			@"UserDefinedName": @"Wi-Fi" };
+		NSDictionary *ipv4 = @{ @"Addresses": @[ @(addr) ], @"SubnetMasks": @[ mask[0] ? @(mask) : @"255.255.255.0" ],
+			@"Router": @(router), @"InterfaceName": @"en0", @"ConfigMethod": @"DHCP" };
+		NSDictionary *dns = @{ @"ServerAddresses": @[ @(router) ] };
+		NSDictionary *global = @{ @"PrimaryInterface": @"en0", @"PrimaryService": sid, @"Router": @(router) };
+		NSString *iface_key = [NSString stringWithFormat:@"State:/Network/Service/%@/Interface", sid];
+		NSString *ipv4_key = [NSString stringWithFormat:@"State:/Network/Service/%@/IPv4", sid];
+		NSString *dns_key = [NSString stringWithFormat:@"State:/Network/Service/%@/DNS", sid];
+		NSString *setup_key = [NSString stringWithFormat:@"Setup:/Network/Service/%@/Interface", sid];
+
+		ok = SCDynamicStoreSetValue(store, (__bridge CFStringRef)iface_key, (__bridge CFDictionaryRef)iface);
+		ok = SCDynamicStoreSetValue(store, (__bridge CFStringRef)ipv4_key, (__bridge CFDictionaryRef)ipv4) && ok;
+		ok = SCDynamicStoreSetValue(store, (__bridge CFStringRef)dns_key, (__bridge CFDictionaryRef)dns) && ok;
+		ok = SCDynamicStoreSetValue(store, CFSTR("State:/Network/Interface/en0/IPv4"), (__bridge CFDictionaryRef)ipv4) && ok;
+		ok = SCDynamicStoreSetValue(store, CFSTR("State:/Network/Global/IPv4"), (__bridge CFDictionaryRef)global) && ok;
+		ok = SCDynamicStoreSetValue(store, (__bridge CFStringRef)setup_key, (__bridge CFDictionaryRef)iface) && ok;
+		printf("net_test: wifi: published AirPort %s inet %s router %s: %s\n", sid.UTF8String, addr, router,
+		    ok ? "ok" : "set failed");
+	}
+	CFRelease(store);
+	notify_post("com.apple.system.config.network_change");
 }
 
 /* ---- resolve, tcp ---------------------------------------------------------------------------------- */
@@ -391,6 +461,7 @@ wifi(void)
 	}
 	for (const char *word = strtok(arguments, " "); word != NULL; word = strtok(NULL, " ")) {
 		wanted |= strcmp(word, "wifi=1") == 0;
+		wanted |= strncmp(word, "scsc=", 5) == 0;
 	}
 	if (!wanted) {
 		return;
@@ -403,6 +474,7 @@ wifi(void)
 		return;
 	}
 	printf("net_test: wifi: en0 is there after %.1f s\n", seconds() - start);
+	start = seconds();                              /* wait for configd from now, not from process start (radio is late) */
 	for (;;) {
 		SCDynamicStoreRef session = SCDynamicStoreCreate(NULL, CFSTR("net_test"), NULL, NULL);
 		NSArray *keys = session ? CFBridgingRelease(SCDynamicStoreCopyKeyList(session, CFSTR("Setup:/Network/Service/[^/]+/Interface"))) : nil;
@@ -416,17 +488,29 @@ wifi(void)
 		if (session != NULL) {
 			CFRelease(session);
 		}
-		if (configd_has_it) {
+		if (configd_has_it && show("en0", true)) {
 			printf("net_test: wifi: configd has a network service for en0 after %.1f s: it configures it itself\n", seconds() - start);
 			return;
 		}
-		if (seconds() - start > 30) {
+		if (seconds() - start > 45) {
 			break;
 		}
 		usleep(500000);
 	}
 	printf("net_test: wifi: configd has no network service for en0 (a kernel without its IOKit objects): DHCP asked for\n");
-	dhcp("en0");
+	{
+		NSString *service = dhcp("en0");
+		double wait = seconds();
+
+		while (!show("en0", true) && seconds() - wait < 45) {
+			usleep(250000);
+		}
+		printf("net_test: waitaddr en0: %s after %.1f s\n", show("en0", true) ? "an address" : "NO address", seconds() - wait);
+		show("en0", false);
+		wifi_publish(service);
+		store("State:/Network/.*");
+		store("Setup:/Network/.*");
+	}
 }
 
 /* ---- watch ------------------------------------------------------------------------------------------ */
@@ -558,7 +642,7 @@ main(int argc, char **argv)
 			} else if (strcmp(step, "store") == 0) {
 				store(i + 1 < argc && strchr(argv[i + 1], ':') != NULL ? argv[++i] : NULL);
 			} else if (strcmp(step, "dhcp") == 0 && i + 1 < argc) {
-				dhcp(argv[++i]);
+				(void)dhcp(argv[++i]);
 			} else if (strcmp(step, "waitaddr") == 0 && i + 2 < argc) {
 				const char *interface = argv[++i];
 				double start = seconds(), limit = atof(argv[++i]);

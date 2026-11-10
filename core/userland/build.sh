@@ -182,7 +182,7 @@ SILEO_BIN="chmod cp mkdir mv rm"
 INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd containermanagerd_system
 /redwood/lib/libhakios.sb.dylib SpringBoard
 /redwood/lib/libhakios.media.dylib mediaserverd
-/redwood/lib/libhakios.app.dylib Sileo
+/redwood/lib/libhakios.app.dylib Sileo MobileNotes
 /redwood/lib/libhakios.tweaks.dylib Preferences"}
 [ -n "$BT" ] && INJECT="$INJECT
 /redwood/lib/libhakios.bluetool.dylib BlueTool"
@@ -590,6 +590,9 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		mkdir -p root/lib/HakiosMetal.bundle
 		cp obj/HakiosMetal root/lib/HakiosMetal.bundle/
 		cp src/HakiosMetal.plist root/lib/HakiosMetal.bundle/Info.plist
+		# the processes shown the device without a boot-arg (src/hakios_metal_shown.c): Notes, whose PencilKit takes
+		# Metal for granted -- with no device it builds a compute pipeline of nil and aborts at the first touch
+		printf 'MobileNotes\n' > root/lib/HakiosMetal.bundle/HakiosMetal.clients
 	fi
 	# METAL=vk: the runtime the plug-in links, the guest's test of it, and the Vulkan driver it opens if not the default
 	if [ -f obj/libmetal2vulkan.dylib ]; then
@@ -682,6 +685,20 @@ fi
 if [ -d ../fw-gpu ]; then
 	mkdir -p root/fw
 	cp ../fw-gpu/* root/fw/
+fi
+# ... and the Galaxy A50's Wi-Fi/Bluetooth chip: mx140.bin from /vendor/etc/wifi and the keep-alive patch made by
+# tools/a50-scsc-ka.py, in ../fw-scsc (drivers/wifi/hakios.scsc.c reads them from fw/ of this image)
+if [ -d ../fw-scsc ]; then
+	mkdir -p root/fw
+	for f in mx140.bin scsc_ka.bin mx140_wlan.hcf mx140_wlan_sw.hcf scsc_country.bin; do
+		[ -f ../fw-scsc/$f ] && install -m 0644 ../fw-scsc/$f root/fw/
+	done
+fi
+# The A50's own Wi-Fi address (hakios.scsc.c: ADD_VIF / en0). Same file as brcmfmac: the phone's
+# /efs/wifi/.mac.info, copied here as fw-wifi/mac.info. Left out with SHARE=1; the driver also reads EFS at run time.
+if [ -z "$SHARE" ] && [ -f ../fw-wifi/mac.info ]; then
+	mkdir -p root/fw
+	install -m 0644 ../fw-wifi/mac.info root/fw/mac.info
 fi
 # ... and the image of the Wi-Fi DSP, from /vendor/firmware_mnt/image of the same Android into ../fw-wifi
 # (drivers/wifi/hakios.wifi.c; 7.6 MB), with what the radio's firmware is sent once it runs: this phone's

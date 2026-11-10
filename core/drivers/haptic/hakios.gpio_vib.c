@@ -184,8 +184,12 @@ hakios_haptic_quiesce(void)
 	if (alive != 0) {
 		leaving = true;
 		motor(false);
-		say("vib: at the run's end: %u runs (%u cut at %u ms), %llu frames from Darwin\n", runs, capped, VIB_MAX_MS,
-		    written_frames);
+		/* loader_return can run from an IPI with interrupts disabled. Never
+		 * enter the serial console here; keep the summary in its RAM log. */
+		char line[192];
+		snprintf(line, sizeof(line), "vib: at the run's end: %u runs (%u cut at %u ms), %llu frames from Darwin\n",
+		    runs, capped, VIB_MAX_MS, written_frames);
+		loader_log_line(line);
 	}
 }
 

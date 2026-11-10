@@ -40,7 +40,7 @@ README for the table.
     ufs_native=4 ufs_native_slots=4 ufs_native_ref_fnv=<YOURS>
     ufs_native_write=userdata ufs_native_data=1 var_hfs=ufs_userdata_data var_save_ms=0
     system_apfs=ufs_system fb_threads=6 fb_rt=1 fb_ca_hz=120 fb_flip=1
-    vib=1 abox=8 tfa9872=3 ea8076=1 backlight=2 brightness_bridge=1
+    vib=1 abox=8 tfa9872=3 ea8076=1 backlight=2 brightness_bridge=1 scsc=6
 
 XNU keeps only about 607 characters of the command line (the loader's own arguments included); whatever is past
 that is dropped without a word. So the A50's defaults live in the drivers: `acpm_soc=9610` also tells the Mali, UFS
@@ -65,6 +65,15 @@ print(hex(h))" lun0.bin`.
   the phone's Tfa9872.cnt says (gain as Samsung's, never more; no SpeakerBoost: hakios.guard.c limits the samples).
 - `ea8076=1 backlight=2 brightness_bridge=1`: the panel's brightness (DCS 51 through DSIM0) from Settings and
   Control Center.
+- `scsc=6`: Wi-Fi. The SCSC S620 is powered through the PMU (the AP must hold its power, WLBT_CTRL_NS MASK_PWR_REQ,
+  before its mailbox is touched: reading it otherwise stops the SoC), its firmware loaded into reserved DRAM and
+  started (CFG_REQ, the TZPC through SMC, the BAAW windows, a keep-alive patch), then Maxwell's management streams,
+  the WLAN service with its HIP4 area and MIB, the country's regulatory rules, and a station for iOS (scan, WPA2,
+  frames). It needs four files from the builder's own phone and Samsung's kernel source, in `core/fw-scsc/` (never
+  in this repository): `mx140.bin`, `mx140_wlan.hcf`, `mx140_wlan_sw.hcf` from `/vendor/etc/wifi`;
+  `scsc_ka.bin` made by `tools/a50-scsc-ka.py <kernel>/drivers/misc/samsung/scsc/platform_mif_9610.c`;
+  `scsc_country.bin` made by `tools/a50-scsc-country.py /vendor/etc/wifi/slsi_reg_database.bin <CC>`.
+  A step that hangs is not tried again at the next boot (a guard word in reserved DRAM).
 - `hang_watch=N` (diagnostic): every second the user stack of SpringBoard's, backboardd's and mediaserverd's main
   threads into the log.
 

@@ -38,3 +38,10 @@ driver BRCMFMAC
 	help    (without it there is no station to give Darwin),
 	help    and the radio unpowered on the way back to the loader. Needs the firmware, NVRAM and CLM of the user's own phone
 	help    in fw-wifi/ (WIFI.md of starlte)
+
+driver SCSC
+	file    bsd/dev/hakios.scsc.c
+	file    bsd/dev/hakios.lx_wpa.c
+	help    the Galaxy A50's Wi-Fi and Bluetooth chip, Samsung's SCSC S620 (Maxwell mx140) on the Exynos 9610's own
+	help    buses (scsc=N: 1 a look at the PMU and mailbox; 3 the firmware and the WLAN service; 4 one ADD_VIF;
+	help    5 one passive scan; 6 the station, en0 and Apple80211, and a WPA2-PSK join)

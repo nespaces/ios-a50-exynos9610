@@ -316,6 +316,7 @@ void hakios_wifi_quiesce(void) {}
 #ifndef HAKIOS_WIFI_STA
 errno_t hakios_apple80211_ioctl(__unused u_long command, __unused void *data) { return EOPNOTSUPP; }
 void HakiosWLANStart(__unused const char *interface, __unused const uint8_t *address) {}
+void HakiosWLANSetLink(__unused bool up) {}
 void hakios_sta_attach(__unused const struct hakios_sta_ops *ops) {}   /* (hakios.lx.c: a radio's station, nobody to give it to) */
 void hakios_sta_lost(__unused int error) {}
 extern void loader_log_line(const char *line);
