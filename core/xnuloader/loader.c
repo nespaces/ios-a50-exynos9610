@@ -4718,7 +4718,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 */
 	if (torch_requested || camera_requested) {
 		dt_begin(&w, "camera");
-		if (torch_requested) {
+		if (camera_requested) {
+			dt_identity(&w, identity_camera, sizeof(identity_camera) / sizeof(identity_camera[0]), identity_camera_data);
+		} else {
 			dt_identity_one(&w, identity_camera, sizeof(identity_camera) / sizeof(identity_camera[0]), identity_camera_data, "flash");
 		}
 		dt_end(&w);
@@ -4828,7 +4830,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * rear-facing-camera, by which SpringBoard shows Camera.app): the iPhone's ISP node, of its
 	 * properties only the camera at the back. Neither a compatible nor a device_type: no driver matches it.
 	 */
-	if (camera_requested) {
+	if (camera_requested || torch_requested) {
 		dt_begin(&w, "isp");
 		dt_prop_u32(&w, "camera-rear", 1);
 		dt_end(&w);

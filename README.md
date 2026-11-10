@@ -24,7 +24,8 @@ This is an independent hobby integration. It is not affiliated with or endorsed 
 | Brightness | EA8076 panel via DSIM0 DCS 51, from Settings and Control Center |
 | Vibration | the motor via its GPIO-switched LDO (`vib=1`) |
 | Wi-Fi | Samsung SCSC S620 (Maxwell `mx140`), a driver of its own (`drivers/wifi/hakios.scsc.c`, `scsc=6`): the chip powered and booted, HIP4, scan, WPA2 join from Settings, DHCP, TCP over it (Safari loads, slowly); Settings does not show the address yet |
-| Not yet | Bluetooth (the same chip), microphone (RT5665, in progress), camera (and so the flashlight), ringtones (AAC), Metal in apps (Notes' drawing), modem |
+| Flashlight | SM5713 FLED1, on/off and brightness from Control Center (`torch=1 sm5713=1`). Tested on the A50 with `/var` in RAM. |
+| Not yet | Bluetooth (the same chip), microphone (RT5665, in progress), camera capture, ringtones (AAC), Metal in apps (Notes' drawing), modem |
 
 ## Building
 

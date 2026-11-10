@@ -89,3 +89,17 @@ In TWRP, back up every partition you care about (at least BOOT, SYSTEM, EFS) to 
    `/dev/block/by-name/boot`.
 
 `-s N` makes a run return to TWRP after N seconds (the log is then in `/sys/fs/pstore`); `-s 0` runs for good.
+
+## Flashlight
+
+Put `torch=1` near the beginning of the boot arguments and keep `sm5713=1`.
+The loader supplies the device-tree properties used by iOS. The SM5713 driver
+accepts on/off and brightness requests from Control Center. The highest level
+uses the board's default torch current. `torch_max_s` controls the cutoff
+(default 30 seconds, capped at 120 seconds).
+
+On/off and brightness were verified on the A50 with a temporary `/var` in RAM.
+The test omitted `var_hfs=ufs_userdata_data` and `ufs_native_write=userdata`.
+In this mode, settings changes last for the current boot. One earlier test
+with persistent `/var` hit SpringBoard crashes and database I/O errors. Camera
+capture is still pending.

@@ -1,7 +1,9 @@
 /*
  * The battery of the Galaxy A50 (SM-A505FN, Exynos 9610): the fuel gauge and the cable detector (MUIC) of its Silicon
- * Mitus SM5713 (charger, fuel gauge, MUIC in one chip), read -- never written -- over i2c_1 (0x13840000) and handed to
- * hakios_battery_report() (drivers/power/hakios.battery.c), the power source iOS reads. Only with boot-arg sm5713=1:
+ * Mitus SM5713 (charger, fuel gauge, MUIC in one chip), read over i2c_1 (0x13840000) and handed to
+ * hakios_battery_report() (drivers/power/hakios.battery.c), the power source iOS reads. Only with boot-arg sm5713=1.
+ * The flashlight (torch=1): FLED1 of the same chip, pin gpa1-3, /dev/hakios-torch. Gauge/MUIC stay read-only;
+ * FLED and the charger's boost are written only while the light is on.
  * every address below belongs to this phone.
  *
  * The bus is the older Samsung I2C ("samsung,s3c2440-i2c"), the touch screen's kind (hakios.melfas_mss100.c, whose
@@ -36,6 +38,7 @@
 #include <sys/uio.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
+#include <mach/mach_time.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
@@ -317,21 +320,22 @@ out:
  * address 0x49: FLED1CNTL2 [6:4] the torch current (the device tree's torch-brightness, 4), FLED1CNTL1 [1:0] = 3 (lit
  * by its pin, "external"), the pin torch-en = gpa1-3 (ALIVE 0x11850000 + 0x40) high. With no cable in, the charger
  * is put into its flash boost (CNTL2 [3:0] = 8, BSTCNTL1 [3:0] = 4.5 V) while lit, as Samsung's table says, and put
- * back after. /dev/hakios-torch takes a level of 0 to 1000 (a 32-bit number); any level above 0 is the one current.
+ * back after. /dev/hakios-torch takes a level of 0 to 1000 (a 32-bit number); nonzero levels map to current codes 0 through the board default (4).
  */
 #define CHG                     0x49
 #define CHG_CNTL2               0x14
 #define CHG_BSTCNTL1            0x23
 #define FLED1CNTL1              0x41
 #define FLED1CNTL2              0x42
-#define TORCH_CURRENT           4
+#define TORCH_CURRENT_MAX       4
 #define ALIVE_PA                0x11850000UL
 #define GPA1                    0x040
 #define TORCH_PIN               3
 #define TORCH_HOT_C             45
 
 static vm_offset_t alive;
-static uint32_t torch_lit;
+static uint32_t torch_lit, torch_max_secs = 30;
+static uint64_t torch_since;
 static bool torch_boost;
 static uint8_t saved_cntl2, saved_bst;
 static lck_mtx_t *torch_lock;
@@ -350,6 +354,7 @@ torch_set(uint32_t level)
 {
 	volatile uint32_t *dat = (volatile uint32_t *)(alive + GPA1 + 4);
 	uint32_t e = 0;
+	uint32_t current = (level * TORCH_CURRENT_MAX + 500u) / 1000u;
 
 	if (level != 0 && torch_lit == 0) {
 		if (!last_external) {
@@ -363,9 +368,22 @@ torch_set(uint32_t level)
 				e |= chg_update(CHG_CNTL2, 0x8, 0xf);
 			}
 		}
-		e |= chg_update(FLED1CNTL2, TORCH_CURRENT << 4, 0x7 << 4);
+		e |= chg_update(FLED1CNTL2, current << 4, 0x7 << 4);
 		e |= chg_update(FLED1CNTL1, 0x3, 0x3);
 		*dat |= 1u << TORCH_PIN;
+		torch_since = mach_absolute_time();
+		say("sm5713: torch on (FLED1 pin gpa1-3, current code %u)%s\n", current, torch_boost ? ", boost" : "");
+	} else if (level != 0 && torch_lit != 0) {
+		uint32_t old_current = (torch_lit * TORCH_CURRENT_MAX + 500u) / 1000u;
+
+		if (current != old_current) {
+			e = chg_update(FLED1CNTL2, current << 4, 0x7 << 4);
+			if (e != 0) {
+				say("sm5713: torch level update failed (%u)\n", e);
+				return false;
+			}
+			say("sm5713: torch level %u, current code %u\n", level, current);
+		}
 	} else if (level == 0 && torch_lit != 0) {
 		*dat &= ~(1u << TORCH_PIN);
 		e |= chg_update(FLED1CNTL1, 0x0, 0x3);
@@ -439,6 +457,8 @@ hakios_torch_init(void)
 	    !PE_parse_boot_argn("sm5713", &battery, sizeof(battery)) || battery == 0) {
 		return;          /* (the bus is the battery driver's: sm5713=1) */
 	}
+	PE_parse_boot_argn("torch_max_s", &torch_max_secs, sizeof(torch_max_secs));
+	torch_max_secs = torch_max_secs == 0 ? 30 : torch_max_secs > 120 ? 120 : torch_max_secs;
 	bus_lock_make();
 	alive = ml_io_map(ALIVE_PA, 0x1000);
 	if (alive == 0) {
@@ -601,6 +621,19 @@ battery_thread(void *arg, __unused wait_result_t wr_)
 				say_state("every 5 minutes", &b, raw, dt);
 			}
 		}
+		if (torch_lock != NULL && torch_lit != 0) {
+			uint64_t on_ns;
+
+			lck_mtx_lock(torch_lock);
+			if (torch_lit != 0) {
+				absolutetime_to_nanoseconds(mach_absolute_time() - torch_since, &on_ns);
+				if (on_ns / NSEC_PER_SEC >= torch_max_secs) {
+					say("sm5713: torch on for %u s: off until asked again\n", torch_max_secs);
+					(void)torch_set(0);
+				}
+			}
+			lck_mtx_unlock(torch_lock);
+		}
 		delay_for_interval(POLL_MS, NSEC_PER_MSEC);
 	}
 out:
@@ -628,4 +661,5 @@ hakios_sm5713_init(void)
 	if (kernel_thread_start(battery_thread, (void *)(uintptr_t)steps, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
+	hakios_torch_init();
 }

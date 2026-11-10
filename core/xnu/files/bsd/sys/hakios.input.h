@@ -93,7 +93,7 @@ struct hakios_battery_state {
 };
 void hakios_battery_report(const struct hakios_battery_state *state);
 void hakios_scfb_battery_init(void);  /* scfb.addr=: the phone's battery under AVF, from the Scion app (hakios.scfb_battery.c) */
-void hakios_sm5713_init(void);         /* boot-arg sm5713=1: the Galaxy A50's fuel gauge and cable detector (I2C), read only */
+void hakios_sm5713_init(void);         /* boot-arg sm5713=1: the Galaxy A50's fuel gauge and MUIC; torch=1: flashlight */
 void hakios_max77705_init(void);       /* boot-arg max77705=1: the Galaxy S9's fuel gauge and charger (I2C), read only */
 void hakios_net_init(void);            /* en0, if there is something to carry its frames: sys/hakios.net.h */
 void hakios_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
