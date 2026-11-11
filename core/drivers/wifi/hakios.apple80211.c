@@ -597,6 +597,15 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 	}
 	case 10:
 		return set_scan(request, said, said_size);
+	/*
+	 * Requests of iOS 16's wifid that this driver has no use for (383 every five seconds, 4104 bytes; 365; 419): refused,
+	 * wifid retried 383 for 10-15 s, and Settings stood still that long when a network was chosen. Taken and ignored.
+	 */
+	case 383:
+	case 365:
+	case 419:
+		snprintf(said, said_size, " (taken, ignored)");
+		return 0;
 	default:
 		return EOPNOTSUPP;
 	}

@@ -2383,7 +2383,7 @@ hip_tx_cmd(vm_offset_t mem, vm_offset_t mbox, struct hip_control *h)
 	} else {
 		err = 0;
 	}
-	if (hip_tx_said < 6 || (hip_tx_said % 64) == 0) {
+	if (hip_tx_said < 6 || (hip_tx_said % 2048) == 0) {
 		say("scsc: data TX %u bytes type %02x%02x %s\n", len, hip_tx_frame[12], hip_tx_frame[13], err == 0 ? "queued" : "failed");
 	}
 	hip_tx_said++;
@@ -2479,7 +2479,7 @@ hip_rx_other(uint16_t id, const uint8_t *s, unsigned siglen, const uint8_t *data
 			return true;
 		}
 		if (desc == 1 && hip_joined_v && len >= 14 && len <= HAKIOS_NET_FRAME_MAX) {
-			if (hip_rx_said < 8 || (hip_rx_said % 16) == 0) {
+			if (hip_rx_said < 8 || (hip_rx_said % 2048) == 0) {
 				say("scsc: data RX %u bytes type %02x%02x (received-frame)\n", len, data[12], data[13]);
 			}
 			hip_rx_said++;
@@ -2520,7 +2520,7 @@ hip_rx_other(uint16_t id, const uint8_t *s, unsigned siglen, const uint8_t *data
 			return true;
 		}
 		if (hip_joined_v && len <= HAKIOS_NET_FRAME_MAX) {
-			if (hip_rx_said < 6 || (hip_rx_said % 32) == 0) {
+			if (hip_rx_said < 6 || (hip_rx_said % 2048) == 0) {
 				say("scsc: data RX %u bytes type %02x%02x\n", len, data[12], data[13]);
 			}
 			hip_rx_said++;

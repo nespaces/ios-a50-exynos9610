@@ -29,6 +29,7 @@ This is an independent hobby integration. It is not affiliated with or endorsed 
 | Camera | in progress: the rear sensor (Sony IMX576) is powered (S2MPB03), clocked and reset, answers on its I2C bus (model id 0576) and streams (`campwr=5`, drivers/camera/hakios.campwr.c; its register tables come from the stock kernel and are not in this repository); the MIPI receiver (CSIS v5.1) is readable; no frame is captured yet |
 | Power off | "slide to power off" ends in TWRP (the shutdown no longer waits on the system unmount); holding the power key for 6 s goes back to TWRP too |
 | Screen rotation | by hand: hold both volume keys for 0.7 s (`kern.hakios.orientation`); the accelerometer is behind the CHUB sensor hub, whose firmware is not loaded yet |
+| Speed | GPU on its 764 MHz level (775 mV, the A50's own ACPM table: 1053/949/839/764/683 MHz at 993.75/900/818.75/775/737.5 mV; `mali_mhz=`, `mali_uv=`), the CPUs on the table's stock top levels with `acpm_cl0=1742000 acpm_cl1=2314000` (A53/A73; hot: there is no thermal driver for the 9610 yet) |
 | Bluetooth | works in part, on the Wi-Fi chip (`scsc=8`): iOS's `bluetoothd` talks HCI to the controller over a kernel control; Settings shows it, other phones see this one, AirPods pair and their controls work. Audio does not go to Bluetooth yet (no route in the audio driver), and the AirPods settings (noise control) do nothing |
 | Not yet | camera capture, ringtones (AAC), Metal in apps (Notes' drawing), modem |
 

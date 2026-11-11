@@ -257,6 +257,10 @@ static const struct g3d_rate { uint32_t mhz, m, p, s; } g3d_rates[] = {
 	{ 764, 382, 13, 0 },
 	/* its fvmap's 683 MHz, 737.5 mV: VCO 1366 MHz, S 1 as Samsung's 550 MHz row (M 550, P 13, S 1) */
 	{ 683, 683, 13, 1 },
+	/* its fvmap's 839 MHz (818.75 mV), 949 (900 mV) and 1053 (993.75 mV): 26 x M / P with S 0, the PLL's 2-8 MHz reference */
+	{ 839, 387, 12, 0 },                    /* 838.5 */
+	{ 949, 146, 4, 0 },
+	{ 1053, 486, 12, 0 },
 };
 static uint32_t mali_mhz = 260;
 static bool pll_quiet;                          /* the governor's switches: a line only when one fails */

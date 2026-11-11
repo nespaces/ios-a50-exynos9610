@@ -1030,6 +1030,9 @@ hakios_exynos_dvfs_start(void)
 
 				n = hakios_acpm_dvfs_table(2 + d, khz, uv, 32, dvfs_say);
 				for (uint32_t l = 0; l < n; l++) {
+					dvfs_say("acpm: 9610: %s level %u: %u kHz, %u uV\n", names[d], l, khz[l], uv[l]);
+				}
+				for (uint32_t l = 0; l < n; l++) {
 					ok |= khz[l] == want[d];
 				}
 				if (got_e[d] != 0 || !ok) {
@@ -1041,6 +1044,13 @@ hakios_exynos_dvfs_start(void)
 				e2 = hakios_acpm_dvfs_get(2 + d, &after);
 				dvfs_say("acpm: 9610: SET %s: %u -> asked %u kHz (%d) -> GET %u kHz (%d)\n", names[d], got[d], want[d], e1,
 				    after, e2);
+			}
+			if (active == 7) {
+				/* the Mali's levels, said only: its rate is mali_mhz's, never set from here */
+				n = hakios_acpm_dvfs_table(4, khz, uv, 32, dvfs_say);
+				for (uint32_t l = 0; l < n; l++) {
+					dvfs_say("acpm: 9610: g3d level %u: %u kHz, %u uV\n", l, khz[l], uv[l]);
+				}
 			}
 			for (uint32_t r = 0; r < 3; r++) {
 				uint8_t out = 0;
