@@ -52,6 +52,8 @@ bl_say(const char * format, ...)
 extern "C" {
 int hakios_panel_register(const char * name, int (*set)(int level));
 int hakios_panel_brightness(int level);
+int hakios_panel_register_power(int (*power)(int on));
+int hakios_panel_power(int on);
 void hakios_backlight_publish(IOService * display);
 }
 
@@ -62,7 +64,22 @@ void hakios_backlight_publish(IOService * display);
 static const char * gPanelName;
 static int (*gPanelSet)(int level);
 static int gPanelLevel = -1;
+static int (*gPanelPower)(int on);
 static uint32_t gBacklightStep;                 /* backlight=: 0 none, 1 said only, 2 taken */
+
+/* a panel that can be put to sleep and woken (iOS's selector 12 of IOMobileFramebuffer) */
+int
+hakios_panel_register_power(int (*power)(int on))
+{
+	gPanelPower = power;
+	return 0;
+}
+
+int
+hakios_panel_power(int on)
+{
+	return gPanelPower != NULL ? gPanelPower(on) : ENODEV;
+}
 
 /* a panel driver that can set its brightness, 0-255: once, at its start */
 int

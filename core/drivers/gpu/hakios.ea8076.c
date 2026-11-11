@@ -12,6 +12,7 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_time.h>
 #include <mach/mach_types.h>
@@ -20,6 +21,8 @@
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_line(const char *line);
+extern kern_return_t kernel_thread_start(thread_continue_t continuation, void *parameter, thread_t *new_thread);
+extern void thread_deallocate(thread_t thread);
 int hakios_panel_register(const char *name, int (*set)(int level));
 void hakios_ea8076_init(void);
 
@@ -53,6 +56,12 @@ static const uint16_t brightness_table[256] = {
 static vm_offset_t dsim;
 static lck_mtx_t *panel_lock;
 static int panel_level = -1;
+/* the panel's sleep: iOS says "screen off" by brightness 0 (backboardd's backlight factor 0); the panel then goes to sleep (DCS 28, 10)
+ * after a moment of it, and wakes (11, 29) with the first brightness above 0. Without it the screen only went very dark (an OLED's
+ * lowest level) and stayed lit. sleep_delay_ms=0 (boot-arg panel_sleep=0) keeps the old behaviour. */
+static uint32_t panel_sleep_ms = 0;
+static uint64_t zero_since;
+static bool panel_asleep;
 
 static int
 say(const char *format, ...)
@@ -131,6 +140,26 @@ panel_set(int level)
 		return EINVAL;
 	}
 	level = level > 255 ? 255 : level;
+	lck_mtx_lock(panel_lock);
+	if (level == 0) {
+		if (zero_since == 0) {
+			zero_since = now;
+		}
+	} else {
+		zero_since = 0;
+		if (panel_asleep) {
+			static const uint8_t sleep_out[] = { 0x11 }, display_on[] = { 0x29 };
+
+			ok = dsim_send(sleep_out, sizeof(sleep_out));
+			lck_mtx_unlock(panel_lock);
+			delay_for_interval(120, NSEC_PER_MSEC);
+			lck_mtx_lock(panel_lock);
+			ok = dsim_send(display_on, sizeof(display_on)) && ok;
+			panel_asleep = false;
+			say("ea8076: the panel wakes (11, 29): %s\n", ok ? "sent" : "NOT SENT");
+		}
+	}
+	lck_mtx_unlock(panel_lock);
 	bl[0] = 0x51;
 	bl[1] = (uint8_t)((brightness_table[level] >> 8) & 0x3);
 	bl[2] = (uint8_t)(brightness_table[level] & 0xff);
@@ -150,6 +179,73 @@ panel_set(int level)
 	return ok ? 0 : EIO;
 }
 
+
+
+/* iOS's own "screen off / on": IOMobileFramebuffer's selector 12 (backboardd, 0 on the power key's lock, 1 on its wake) */
+extern int hakios_panel_register_power(int (*power)(int on));
+
+static int
+panel_power(int on)
+{
+	static const uint8_t display_off[] = { 0x28 }, sleep_in[] = { 0x10 }, sleep_out[] = { 0x11 }, display_on[] = { 0x29 };
+	bool ok = true;
+
+	if (dsim == 0) {
+		return EINVAL;
+	}
+	lck_mtx_lock(panel_lock);
+	if (!on && !panel_asleep) {
+		ok = dsim_send(display_off, sizeof(display_off));
+		lck_mtx_unlock(panel_lock);
+		delay_for_interval(30, NSEC_PER_MSEC);
+		lck_mtx_lock(panel_lock);
+		ok = dsim_send(sleep_in, sizeof(sleep_in)) && ok;
+		panel_asleep = true;
+		say("ea8076: the screen is off (28, 10): %s\n", ok ? "sent" : "NOT SENT");
+	} else if (on && panel_asleep) {
+		ok = dsim_send(sleep_out, sizeof(sleep_out));
+		lck_mtx_unlock(panel_lock);
+		delay_for_interval(120, NSEC_PER_MSEC);
+		lck_mtx_lock(panel_lock);
+		ok = dsim_send(display_on, sizeof(display_on)) && ok;
+		panel_asleep = false;
+		say("ea8076: the screen is on (11, 29): %s\n", ok ? "sent" : "NOT SENT");
+	}
+	lck_mtx_unlock(panel_lock);
+	if (on && panel_level >= 0) {
+		(void)panel_set(panel_level);
+	}
+	return ok ? 0 : EIO;
+}
+
+static void
+panel_sleeper(__unused void *arg, __unused wait_result_t wr)
+{
+	static const uint8_t display_off[] = { 0x28 }, sleep_in[] = { 0x10 };
+
+	for (;;) {
+		uint64_t now = mach_absolute_time(), wait;
+		bool go = false;
+
+		nanoseconds_to_absolutetime((uint64_t)panel_sleep_ms * NSEC_PER_MSEC, &wait);
+		lck_mtx_lock(panel_lock);
+		if (zero_since != 0 && !panel_asleep && now - zero_since >= wait) {
+			bool ok = dsim_send(display_off, sizeof(display_off));
+
+			lck_mtx_unlock(panel_lock);
+			delay_for_interval(30, NSEC_PER_MSEC);
+			lck_mtx_lock(panel_lock);
+			ok = dsim_send(sleep_in, sizeof(sleep_in)) && ok;
+			panel_asleep = true;
+			go = true;
+			say("ea8076: the screen is off (28, 10): %s\n", ok ? "sent" : "NOT SENT");
+		}
+		lck_mtx_unlock(panel_lock);
+		(void)go;
+		delay_for_interval(200, NSEC_PER_MSEC);
+	}
+}
+
 void
 hakios_ea8076_init(void)
 {
@@ -167,6 +263,15 @@ hakios_ea8076_init(void)
 	say("ea8076: DSIM0 FIFOCTRL %x INTSRC %x; iOS's brightness goes to the panel (51)\n", rd(DSIM_FIFOCTRL),
 	    rd(DSIM_INTSRC));
 	(void)hakios_panel_register("ea8076", panel_set);
+	(void)hakios_panel_register_power(panel_power);
+	(void)PE_parse_boot_argn("panel_sleep", &panel_sleep_ms, sizeof(panel_sleep_ms));
+	if (panel_sleep_ms != 0) {
+		thread_t thread;
+
+		if (kernel_thread_start(panel_sleeper, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		}
+	}
 	if (PE_parse_boot_argn("panel_brightness", &level, sizeof(level))) {
 		(void)panel_set((int)level);
 	}

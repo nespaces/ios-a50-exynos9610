@@ -1,0 +1,22 @@
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp	2026-11-11 22:29:22.239695725 +0300
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp	2026-11-11 22:29:22.246388682 +0300
+@@ -46,6 +46,7 @@
+ extern "C" bool hakios_vgpu3d_host_owns(uint32_t sid);
+ 
+ extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
++extern "C" int hakios_panel_power(int on);                /* drivers/gpu/hakios.backlight.cpp: the panel to sleep (0) or awake (1), ENODEV without one */
+ extern "C" int hakios_panel_brightness(int level);       /* drivers/gpu/hakios.backlight.cpp: 0 if a panel driver took it, else ENODEV */
+ extern "C" void hakios_backlight_publish(IOService * display);  /* the same: AppleARMBacklight, with boot-arg backlight= */
+ 
+@@ -3184,6 +3185,10 @@
+ 	case kFBMethodSwapCancel:
+ 	case kFBMethodSwapCancelAll:
+ 	case kFBMethodRequestPowerChange:
++		if (args->scalarInputCount > 0) {
++			(void) hakios_panel_power(in[0] != 0 ? 1 : 0);
++		}
++		return kIOReturnSuccess;
+ 	case kFBMethodChangeFrameInfo:
+ 		return kIOReturnSuccess;
+ 
