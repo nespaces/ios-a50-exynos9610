@@ -699,6 +699,13 @@ if [ -d ../fw-gpu ]; then
 fi
 # ... and the Galaxy A50's Wi-Fi/Bluetooth chip: mx140.bin from /vendor/etc/wifi and the keep-alive patch made by
 # tools/a50-scsc-ka.py, in ../fw-scsc (drivers/wifi/hakios.scsc.c reads them from fw/ of this image)
+# the A50's camera sensor tables (tools in notes: the vendor kernel's, pulled out of its boot.img; kept out of the repository)
+if [ -d ../fw-a50cam ]; then
+	mkdir -p root/fw
+	for f in ../fw-a50cam/*.regs; do
+		[ -f "$f" ] && install -m 0644 "$f" root/fw/
+	done
+fi
 if [ -d ../fw-scsc ]; then
 	mkdir -p root/fw
 	for f in mx140.bin scsc_ka.bin mx140_bt.hcf mx140_wlan.hcf mx140_wlan_sw.hcf scsc_country.bin; do

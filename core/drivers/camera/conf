@@ -31,3 +31,8 @@ driver EXYNOS_CAMERA
 
 standard bsd/dev/hakios.sccam_torch.c
 	help    the phone's flashlight under AVF, through the Scion app's camera block (patch 1402)
+
+driver CAMPWR
+	file    bsd/dev/hakios.campwr.c
+	help    the Galaxy A50's camera supplies: the S2MPB03 on i2c_2 (campwr=N: 1 read it, 2 the rear camera's three
+	help    supplies on for two seconds and off)

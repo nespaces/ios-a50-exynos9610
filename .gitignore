@@ -41,3 +41,4 @@ known_hosts
 __pycache__/
 .DS_Store
 Thumbs.db
+core/fw-a50cam/
