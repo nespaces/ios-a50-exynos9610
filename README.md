@@ -26,7 +26,7 @@ This is an independent hobby integration. It is not affiliated with or endorsed 
 | Wi-Fi | Samsung SCSC S620 (Maxwell `mx140`), a driver of its own (`drivers/wifi/hakios.scsc.c`, `scsc=6`): the chip powered and booted, HIP4, scan, WPA2 join from Settings, DHCP, TCP over it (Safari loads, slowly); Settings does not show the address yet |
 | Flashlight | SM5713 FLED1, on/off and brightness from Control Center (`torch=1 sm5713=1`). Tested on the A50 with `/var` in RAM. |
 | Microphone | RT5665 codec (MAINMIC on IN3) → ABOX UAIF0 → `/dev/hakios-mic`: Voice Memos records a voice (`rt5665=3 abox_mic=1`, `drivers/audio/hakios.rt5665.c`) |
-| Bluetooth | in progress, on the Wi-Fi chip: the controller runs and iOS's `bluetoothd` talks HCI to it over a kernel control (BLE scan works); the stack still restarts on a Broadcom vendor command, so no pairing yet |
+| Bluetooth | works in part, on the Wi-Fi chip (`scsc=8`): iOS's `bluetoothd` talks HCI to the controller over a kernel control; Settings shows it, other phones see this one, AirPods pair and their controls work. Audio does not go to Bluetooth yet (no route in the audio driver), and the AirPods settings (noise control) do nothing |
 | Not yet | camera capture, ringtones (AAC), Metal in apps (Notes' drawing), modem |
 
 ## Building

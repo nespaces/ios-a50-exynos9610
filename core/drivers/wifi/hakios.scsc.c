@@ -3326,6 +3326,16 @@ scsc_bt_send(__unused kern_ctl_ref ref, uint32_t unit, __unused void *info, mbuf
 				bt_vs_opcode = opcode;
 				bt_vs_first = bt_used >= 5 ? bt_fragment[4] : 0;
 			}
+			if (opcode == 0x200b && bt_used >= 11) {
+				/* The controller refuses LE Set Scan Enable (0x200c) with 0x12 for
+				 * iOS's 300 ms interval; its own probe scans at 60 ms / 30 ms and the
+				 * controller accepts that. Ask for those, from the public address (iOS
+				 * never sends LE Set Random Address for its own type 1). */
+				/* keep iOS's own interval and window (a 30 ms window every 300 ms leaves the antenna to Wi-Fi
+				 * ninety percent of the time; 60/30 took half of it and the firmware faulted 0x2a81) */
+				bt_fragment[9] = 0;
+				say("scsc-bt: LE scan parameters from the public address, interval %#x window %#x\n", hip_u16(bt_fragment + 5), hip_u16(bt_fragment + 7));
+			}
 			if (opcode == 0x0c31 || opcode == 0x0c33 || opcode == 0x0c35 || opcode == 0x0c5a || opcode == 0x0c5b) {
 				error = bt_host_command(bt_fragment + 1, bt_used - 1);
 			} else if (!bt_hci_send(bt_protocol, bt_mbox, bt_fragment + 1, bt_used - 1)) {
@@ -3333,18 +3343,6 @@ scsc_bt_send(__unused kern_ctl_ref ref, uint32_t unit, __unused void *info, mbuf
 			}
 			if (bt_tx_said++ < 140) {
 				say("scsc-bt: iOS TX unit %u HCI %#x len %u errno %d\n", unit, opcode, bt_used - 1, error);
-			}
-			if (opcode == 0x200b && bt_used >= 11) {
-				/* The controller refuses LE Set Scan Enable (0x200c) with 0x12 for
-				 * iOS's 300 ms interval; its own probe scans at 60 ms / 30 ms and the
-				 * controller accepts that. Ask for those, from the public address (iOS
-				 * never sends LE Set Random Address for its own type 1). */
-				bt_fragment[5] = 0x60;
-				bt_fragment[6] = 0x00;
-				bt_fragment[7] = 0x30;
-				bt_fragment[8] = 0x00;
-				bt_fragment[9] = 0;
-				say("scsc-bt: LE scan parameters set to 60/30 ms from the public address\n");
 			}
 			if (opcode == 0x200b || opcode == 0x200c) {
 				/* The controller answers 0x12 (Invalid HCI Command Parameters) to the LE
@@ -3361,6 +3359,8 @@ scsc_bt_send(__unused kern_ctl_ref ref, uint32_t unit, __unused void *info, mbuf
 	mbuf_freem(m);
 	return error;
 }
+
+static unsigned bt_card_said;
 
 static errno_t
 scsc_bt_getopt(__unused kern_ctl_ref ref, __unused uint32_t unit, __unused void *info, int opt, void *data, size_t *len)
@@ -3456,6 +3456,24 @@ scsc_bt_events(__unused void *arg, __unused wait_result_t result)
 					bt_host_used = bt_host_mtu = bt_host_count = 0;
 					memset(bt_links, 0, sizeof(bt_links));
 					lck_mtx_unlock(&scsc_bt_lock);
+				}
+				if (n >= 16 && h4[1] == 0x3e && h4[3] == 0x02 && h4[4] == 1 && 14u + h4[13] <= (unsigned)n + 1) {
+					/* Apple's "proximity pairing" advertisement (company 0x004c, type 0x07) is what
+					 * makes SharingViewService put AirPods' setup card on the screen; with no
+					 * way to dismiss it here, the card stays over everything. Not delivered. */
+					bool card = false;
+					for (unsigned at = 14, end = 14u + h4[13]; at + 5 < end; at += 1u + h4[at]) {
+						if (h4[at] == 0) { break; }
+						if (h4[at] >= 4 && h4[at + 1] == 0xff && h4[at + 2] == 0x4c && h4[at + 3] == 0 && h4[at + 4] == 0x07) {
+							card = true;
+							break;
+						}
+					}
+					if (card) {
+						if (bt_card_said++ < 4) { say("scsc-bt: Apple proximity-pairing advertisement not delivered\n"); }
+						bt_hci_pop(bt_protocol, bt_mbox, index);
+						continue;
+					}
 				}
 				errno_t err = ctl_enqueuedata(bt_ctl, unit, h4, (size_t)n + 1, 0);
 				if (err != 0) {

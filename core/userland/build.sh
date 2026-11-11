@@ -170,6 +170,16 @@ if [ -n "$BT" ]; then
 	DARWIN_JOBS="$DARWIN_JOBS com.apple.bluetoothd com.apple.BlueTool"
 	export BT_HCI_TRANSPORT=${BT_HCI_TRANSPORT-H4:POSIX:com.apple.uart.bluetooth,4000000}
 fi
+# The device's name (Settings, Bluetooth's "discoverable as ..."): MobileGestalt's UserAssignedDeviceName comes from
+# SystemConfiguration's preferences; without them it is null. DEVICE_NAME= changes it.
+mkdir -p var/preferences/SystemConfiguration
+python3 - "${DEVICE_NAME-iPhone}" <<'PY'
+import plistlib, sys
+n = sys.argv[1]
+p = {'System': {'System': {'ComputerName': n, 'ComputerNameEncoding': 0, 'HostName': n.replace(' ', '-')},
+                'Network': {'HostNames': {'LocalHostName': n.replace(' ', '-')}}}}
+plistlib.dump(p, open('var/preferences/SystemConfiguration/preferences.plist', 'wb'))
+PY
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libhakios.dylib, src/inject_sb.c is libhakios.sb.dylib, src/inject_media.c is
 # libhakios.media.dylib).
@@ -634,6 +644,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	rm -f root/etc/var.skel.bak
 	# ... and the files of ours it puts there (var/): those under mobile/ belong to the user mobile
 	cp -r var root/var
+	printf 'd\t755\t0\t0\t/private/var/preferences/SystemConfiguration\n' >> root/etc/var.skel
 	(cd var && find . -type f | sed 's|^\./||' | sort) | while read -r f; do
 		case $f in mobile/*) owner=501 ;; *) owner=0 ;; esac
 		printf 'f\t644\t%s\t%s\t/private/var/%s\t/var/%s\n' $owner $owner "$f" "$f"
@@ -690,7 +701,7 @@ fi
 # tools/a50-scsc-ka.py, in ../fw-scsc (drivers/wifi/hakios.scsc.c reads them from fw/ of this image)
 if [ -d ../fw-scsc ]; then
 	mkdir -p root/fw
-	for f in mx140.bin scsc_ka.bin mx140_wlan.hcf mx140_wlan_sw.hcf scsc_country.bin; do
+	for f in mx140.bin scsc_ka.bin mx140_bt.hcf mx140_wlan.hcf mx140_wlan_sw.hcf scsc_country.bin; do
 		[ -f ../fw-scsc/$f ] && install -m 0644 ../fw-scsc/$f root/fw/
 	done
 fi
