@@ -4356,6 +4356,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	int torch_requested = 0;
 	/* "cam=5" there too: the phone's wide camera is Darwin's (drivers/camera/hakios.camera.c) */
 	int camera_requested = 0;
+	/* "unpark=1": core 1 is offered to the kernel although S-Boot is believed to park it (guessed from the S9 on the A50) */
+	int unpark_core1 = 0;
 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
 	gamut_p3 = 0;
 	/* a run that does not ask for writes does not get them, whatever an earlier run of this
@@ -4387,6 +4389,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
 		    (c[9] == 0 || c[9] == ' ');
 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
+		unpark_core1 |= starts_with(c, "unpark=1") && (c == pi.cmdline || c[-1] == ' ');
 		camera_requested |= starts_with(c, "cam=5") && (c == pi.cmdline || c[-1] == ' ') && (c[5] == 0 || c[5] == ' ');
 		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');
 		/*
@@ -4778,7 +4781,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 				if (((int)((plat->small_cores >> core) & 1) == boot_small) != (pass == 0)) {
 					continue;
 				}
-				if ((plat->parked_cores >> core) & 1) {
+				if (((plat->parked_cores >> core) & 1) && !(unpark_core1 && core == 1)) {
 					print("core %x is the boot loader's (parked): not the kernel's\n", mpidr);
 					continue;
 				}

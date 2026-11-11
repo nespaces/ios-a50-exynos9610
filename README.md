@@ -14,7 +14,7 @@ This is an independent hobby integration. It is not affiliated with or endorsed 
 | Boot | S-Boot → `devices/a50/soc/shim` (EL1, no UEFI) → xnuloader → XNU 22.5 → launchd → SpringBoard |
 | Display | S-Boot's framebuffer (1080×2340, DECON_F), TE-driven, triple-buffered by the DPU (no tearing); iOS's 1125×2436 scaled on 6 cores, ~60 fps in the UI |
 | Storage | own UFS driver for the 9610 (`ufs_native=4`): iOS system on SYSTEM, `/private/var` (HFS+) on USERDATA, kept between boots |
-| CPU | 7 of 8 cores (S-Boot parks one), PSCI via a low trampoline (EL3 keeps 32 bits of the entry) |
+| CPU | all 8 cores (`cpus=8 unpark=1`: core 1 was only believed to be parked, as on the S9, and starts fine), PSCI via a low trampoline (EL3 keeps 32 bits of the entry) |
 | GPU | Mali-G72 MP3 with Mesa/Panfrost (accelerated CoreAnimation), 683 MHz via ACPM-driven rail |
 | Touch | Melfas MSS100 (`drivers/input/hakios.melfas_mss100.c`) |
 | Keys | power / volume (`exynos_keys=2`) |
@@ -27,6 +27,7 @@ This is an independent hobby integration. It is not affiliated with or endorsed 
 | Flashlight | SM5713 FLED1, on/off and brightness from Control Center (`torch=1 sm5713=1`). Tested on the A50 with `/var` in RAM. |
 | Microphone | RT5665 codec (MAINMIC on IN3) → ABOX UAIF0 → `/dev/hakios-mic`: Voice Memos records a voice (`rt5665=3 abox_mic=1`, `drivers/audio/hakios.rt5665.c`) |
 | Camera | in progress: the rear sensor (Sony IMX576) is powered (S2MPB03), clocked and reset, answers on its I2C bus (model id 0576) and streams (`campwr=5`, drivers/camera/hakios.campwr.c; its register tables come from the stock kernel and are not in this repository); the MIPI receiver (CSIS v5.1) is readable; no frame is captured yet |
+| Power off | "slide to power off" ends in TWRP (the shutdown no longer waits on the system unmount); holding the power key for 6 s goes back to TWRP too |
 | Screen rotation | by hand: hold both volume keys for 0.7 s (`kern.hakios.orientation`); the accelerometer is behind the CHUB sensor hub, whose firmware is not loaded yet |
 | Bluetooth | works in part, on the Wi-Fi chip (`scsc=8`): iOS's `bluetoothd` talks HCI to the controller over a kernel control; Settings shows it, other phones see this one, AirPods pair and their controls work. Audio does not go to Bluetooth yet (no route in the audio driver), and the AirPods settings (noise control) do nothing |
 | Not yet | camera capture, ringtones (AAC), Metal in apps (Notes' drawing), modem |

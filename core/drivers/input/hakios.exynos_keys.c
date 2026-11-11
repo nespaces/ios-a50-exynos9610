@@ -125,6 +125,24 @@ static int orientation_now = 1;
 SYSCTL_INT(_kern_hakios, OID_AUTO, orientation, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY | CTLFLAG_KERN,
     &orientation_now, 0, "UIDeviceOrientation chosen by holding both volume keys: 1 portrait, 3 landscape left, 2 upside down, 4 landscape right");
 
+extern void loader_return(void);
+
+/* The power key held for six seconds hands the phone back to the loader (TWRP): there is no power-off in the iOS here yet. */
+static void
+keys_longpress(void)
+{
+	static unsigned held_ticks;
+
+	if (keyset[0].held) {
+		if (++held_ticks == 6000 / POLL_MS) {
+			say("exynos_keys: the power key held for six seconds: back to the loader\n");
+			loader_return();
+		}
+	} else {
+		held_ticks = 0;
+	}
+}
+
 static void
 keys_chord(void)
 {
@@ -177,6 +195,7 @@ keys_poll(void)
 		}
 	}
 	keys_chord();
+	keys_longpress();
 }
 
 static void

@@ -1,0 +1,18 @@
+diff --git a/bsd/kern/kern_shutdown.c b/bsd/kern/kern_shutdown.c
+index 20d9d475e0b9..0a1445ce05ed 100644
+--- a/bsd/kern/kern_shutdown.c
++++ b/bsd/kern/kern_shutdown.c
+@@ -283,8 +283,12 @@ reboot_kernel(int howto, char *message)
+ 		if (!(howto & RB_PANIC) || !kdp_has_polled_corefile())
+ #endif /* DEVELOPMENT || DEBUG */
+ 		{
++			/*
++			 * The system volumes (the read-only root, /dev) are not unmounted here: on this port
++			 * vfs_unmountall(system) never came back after "unmount(0) /dev" and a halt hung there
++			 * with the shutdown spinner on (slide to power off); the loader takes the machine back.
++			 */
+ 			startTime = mach_absolute_time();
+-			vfs_unmountall(FALSE);
+ 			halt_log_enter("vfs_unmountall", 0, mach_absolute_time() - startTime);
+ 		}
+ 

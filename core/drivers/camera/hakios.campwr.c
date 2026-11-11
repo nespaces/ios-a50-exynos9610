@@ -311,6 +311,94 @@ cam_block_stage(void)
 	say("campwr: CSIS0 CSIS_VERSION %#x CMN_CTRL %#x DPHY_STATUS %#x\n", rd(csis, 0x0), rd(csis, 0x4), rd(csis, 0x20));
 }
 
+/*
+ * The MIPI receiver for the IMX576's mode 0 (2880x2156, RAW10, 4 lanes, 2300 Mbps a lane, settle 0): Samsung's
+ * csi_hw_* of fimc-is2/sensor/csi2/fimc-is-hw-csi-v5_1.c in the order fimc-is-device-csi.c calls them. D-PHY: PMU
+ * 0x70c bit 0 isolation bypass, then reset bit 4 of the CAM sysreg word at 0x14510800 low and high (phy-exynos-mipi.c,
+ * dphy_m4s4s4_csis). CSIS0 0x14400000: CMN_CTRL +4 (CSI_EN b0, SW_RESET b1, LANE_NUMBER b8-9, PHY_SEL b21, UPDATE_SHADOW
+ * b16-19), ISP_CONFIG_CH0 +0x40 (VIRTUAL_CHANNEL b0-1, DATAFORMAT b2-7, PIXEL_MODE b12-13), ISP_RESOL_CH0 +0x44, PHY at
+ * +0x700: STATUS, CMN_CTRL +0x704 (ENABLE_CLK b0, ENABLE_DAT b1-4, S_BYTE_CLK_ENABLE b7, S_CLKSETTLECTL b16-23, HSSETTLE
+ * b24-31), BCTRL_0..3 +0x708.., SCTRL_0..3 +0x718..., SCTRL_4..6 +0x748....
+ */
+static vm_offset_t csis_base;
+
+static void
+csis_setup(vm_offset_t pmu)
+{
+	vm_offset_t sysreg = ml_io_map(0x14510000UL, 0x1000), cmu = ml_io_map(0x14500000UL, 0x4000);
+	uint32_t v;
+
+	csis_base = ml_io_map(0x14400000UL, 0x1000);
+	if (sysreg == 0 || csis_base == 0 || cmu == 0) {
+		say("campwr: CSIS blocks could not be mapped\n");
+		csis_base = 0;
+		return;
+	}
+	say("campwr: before: PMU 0x70c %#x, sysreg 0x800 %#x, CSIS CMN_CTRL %#x PHY_STATUS %#x\n", rd(pmu, 0x70c), rd(sysreg, 0x800),
+	    rd(csis_base, 0x4), rd(csis_base, 0x700));
+	wr(pmu, 0x70c, rd(pmu, 0x70c) | 1u);                    /* isolation bypass */
+	wr(sysreg, 0x800, rd(sysreg, 0x800) & ~(1u << 4));      /* reset */
+	delay(100);
+	wr(sysreg, 0x800, rd(sysreg, 0x800) | (1u << 4));       /* released */
+	delay(100);
+	say("campwr: D-PHY isolation bypassed, reset released: PMU 0x70c %#x, sysreg 0x800 %#x, PHY_STATUS %#x\n", rd(pmu, 0x70c),
+	    rd(sysreg, 0x800), rd(csis_base, 0x700));
+	/* csi_hw_reset */
+	wr(csis_base, 0x4, rd(csis_base, 0x4) | (1u << 1));
+	for (unsigned us = 0; us < 1000 && (rd(csis_base, 0x4) & (1u << 1)); us += 10) {
+		delay(10);
+	}
+	/* csi_hw_s_phy_default_value */
+	wr(csis_base, 0x708, 0x1f4);
+	wr(csis_base, 0x70c, 0x800);
+	wr(csis_base, 0x710, 0x10001249);
+	wr(csis_base, 0x714, 0x500002);
+	wr(csis_base, 0x718, 0x9e003e00);
+	wr(csis_base, 0x71c, 0x46);
+	wr(csis_base, 0x720, 0x2c);
+	wr(csis_base, 0x724, 0x200);
+	wr(csis_base, 0x748, 0x3fea);
+	wr(csis_base, 0x74c, 0xc0000);
+	wr(csis_base, 0x750, 0x140);
+	/* csi_hw_s_settle: HSSETTLE 0, S_CLKSETTLECTL 1 */
+	v = rd(csis_base, 0x704);
+	v = (v & ~(0xffu << 24)) | 0;
+	v = (v & ~(0xffu << 16)) | (1u << 16);
+	wr(csis_base, 0x704, v);
+	/* csi_hw_s_phy_config: 2300 Mbps: deskew, coarse delay for 2-3 Gbps, byte clock */
+	v = rd(csis_base, 0x718) | 1u;
+	v &= ~(1u << 12);
+	wr(csis_base, 0x718, v);
+	wr(csis_base, 0x704, rd(csis_base, 0x704) | (1u << 7));
+	/* csi_hw_s_lane: 4 lanes */
+	wr(csis_base, 0x4, (rd(csis_base, 0x4) & ~(3u << 8)) | (3u << 8));
+	wr(csis_base, 0x704, (rd(csis_base, 0x704) & ~(0xfu << 1)) | (0xfu << 1));
+	/* csi_hw_s_config, VC0: virtual channel 0, RAW10 (0x2b), four pixels a clock (the DMA is not used yet); 2880 x 2156 */
+	v = rd(csis_base, 0x40);
+	v = (v & ~0x3u) | 0;
+	v = (v & ~(0x3fu << 2)) | (0x2bu << 2);
+	v = (v & ~(3u << 12)) | (2u << 12);
+	wr(csis_base, 0x40, v);
+	wr(csis_base, 0x44, (2156u << 16) | 2880u);
+	/* csi_hw_enable: update shadow, PHY select 0, PHY clock on, CSI on */
+	wr(csis_base, 0x4, rd(csis_base, 0x4) | (0xfu << 16));
+	wr(csis_base, 0x4, rd(csis_base, 0x4) & ~(1u << 21));
+	wr(csis_base, 0x704, rd(csis_base, 0x704) | 1u);
+	wr(csis_base, 0x4, rd(csis_base, 0x4) | 1u);
+	say("campwr: CSIS0 set up: CMN_CTRL %#x PHY_CMN_CTRL %#x ISP_CONFIG_CH0 %#x RESOL %#x PHY_STATUS %#x\n", rd(csis_base, 0x4),
+	    rd(csis_base, 0x704), rd(csis_base, 0x40), rd(csis_base, 0x44), rd(csis_base, 0x700));
+}
+
+static void
+csis_report(const char *when)
+{
+	if (csis_base == 0) {
+		return;
+	}
+	say("campwr: CSIS0 %s: frame count VC0 %u VC1 %u, INT_SRC0 %#x INT_SRC1 %#x, PHY_STATUS %#x, CMN_CTRL %#x\n", when,
+	    rd(csis_base, 0x100), rd(csis_base, 0x104), rd(csis_base, 0x14), rd(csis_base, 0x1c), rd(csis_base, 0x700), rd(csis_base, 0x4));
+}
+
 static void
 sensor_stage(uint32_t steps)
 {
@@ -372,6 +460,11 @@ sensor_stage(uint32_t steps)
 		if (regs == NULL) {
 			say("campwr: fw/imx576_2880x2156.regs is not in the image\n");
 		} else {
+			if (steps >= 7) {
+				vm_offset_t pmu = ml_io_map(0x11860000UL, 0x5000);
+
+				if (pmu != 0) { csis_setup(pmu); }
+			}
 			count = (unsigned)(size / 3);
 			for (unsigned i = 0; i < count; i++) {
 				uint16_t reg = (uint16_t)(regs[3 * i] | regs[3 * i + 1] << 8);
@@ -381,12 +474,40 @@ sensor_stage(uint32_t steps)
 				}
 			}
 			say("campwr: %u registers written, %u failed\n", count, failed);
+			csis_report("before streaming");
+			/* Samsung's sensor_imx576_cis_stream_on(): group hold, 0x3040 and 0x3F71, mode_select, release */
+			(void)sensor_write(0x0104, 1);
+			(void)sensor_write(0x3040, 1);
+			(void)sensor_write(0x3f71, 1);
 			error = sensor_write(0x0100, 1);
+			(void)sensor_write(0x0104, 0);
 			delay(100000);
+			csis_report("100 ms after streaming on");
 			(void)sensor_read(0x0005, &f1);
 			(void)sensor_read(0x0100, &mode);
 			delay(50000);
 			(void)sensor_read(0x0005, &f2);
+			csis_report("150 ms after streaming on");
+			{
+				static const uint16_t regs_to_read[] = { 0x0114, 0x0112, 0x0113, 0x0340, 0x0341, 0x0342, 0x0343, 0x034c, 0x034d,
+				    0x034e, 0x034f, 0x0306, 0x0307, 0x030e, 0x030f, 0x0820, 0x0821, 0x0822, 0x0823, 0x0136, 0x0137, 0x3040, 0x3f71 };
+				char line[240];
+				unsigned used = 0;
+
+				for (unsigned i = 0; i < sizeof(regs_to_read) / sizeof(regs_to_read[0]); i++) {
+					uint8_t b = 0xee;
+
+					(void)sensor_read(regs_to_read[i], &b);
+					used += (unsigned)snprintf(line + used, sizeof(line) - used, " %04x=%02x", regs_to_read[i], b);
+				}
+				say("campwr: sensor readback:%s\n", line);
+				if (csis_base != 0) {
+					vm_offset_t cmu = ml_io_map(0x14500000UL, 0x4000);
+
+					say("campwr: CMU_CAM gates: ACLK_CSIS0 %#x GLUE_CSIS0 %#x QCH_CSIS0 %#x; CSIS CLK_CTRL %#x\n", rd(cmu, 0x2018),
+					    rd(cmu, 0x202c), rd(cmu, 0x3020), rd(csis_base, 0x8));
+				}
+			}
 			say("campwr: streaming on (error %#x): mode_select %#x, frame counter %u then %u (50 ms later)\n", error, mode, f1, f2);
 			(void)sensor_write(0x0100, 0);
 		}
