@@ -1478,6 +1478,25 @@ sensors_thread(void *arg)
 	return NULL;
 }
 
+/* the orientation chosen by hand: kern.hakios.orientation, set by both volume keys held (the kernel's exynos_keys.c) */
+static void *
+orientation_keys_thread(__unused void *arg)
+{
+	int last = 0;
+
+	for (;;) {
+		int value = 0;
+		size_t size = sizeof(value);
+
+		if (sysctlbyname("kern.hakios.orientation", &value, &size, NULL, 0) == 0 && value != last && value >= 1 && value <= 4) {
+			last = value;
+			orientation_changed(value);
+		}
+		usleep(300000);
+	}
+	return NULL;
+}
+
 /* only when the kernel has a sensor hub running (shub=6): otherwise nothing of this happens */
 static void
 sensors_start(void)
@@ -1486,6 +1505,16 @@ sensors_start(void)
 	int device = open(HAKIOS_SENSORS_DEVICE, O_RDONLY);
 
 	if (device < 0) {
+		/* no hub: the phone's orientation is the one chosen with both volume keys (kernel, exynos_keys.c) */
+		int value = 0;
+		size_t size = sizeof(value);
+
+		if (sysctlbyname("kern.hakios.orientation", &value, &size, NULL, 0) == 0) {
+			orientation_fixes();
+			if (pthread_create(&thread, NULL, orientation_keys_thread, NULL) == 0) {
+				pthread_detach(thread);
+			}
+		}
 		return;
 	}
 	orientation_fixes();

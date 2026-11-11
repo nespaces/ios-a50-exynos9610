@@ -39,6 +39,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
@@ -112,6 +113,39 @@ key_held(const struct key *k)
 	return ((rd(k->bank + BANK_DAT) >> k->pin) & 1) == 0;
 }
 
+
+/*
+ * Rotation by hand. The A50's accelerometer sits behind the sensor hub (a firmware of Samsung's that nobody loads here
+ * yet), so nothing tells iOS which way up the phone is. Both volume keys held for 0.7 s turn the screen to the next
+ * orientation -- UIDeviceOrientation 1 portrait, 3 landscape left, 2 upside down, 4 landscape right -- which
+ * backboardd reads from kern.hakios.orientation (userland/src/inject.c).
+ */
+SYSCTL_DECL(_kern_hakios);
+static int orientation_now = 1;
+SYSCTL_INT(_kern_hakios, OID_AUTO, orientation, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY | CTLFLAG_KERN,
+    &orientation_now, 0, "UIDeviceOrientation chosen by holding both volume keys: 1 portrait, 3 landscape left, 2 upside down, 4 landscape right");
+
+static void
+keys_chord(void)
+{
+	static unsigned held_ticks;
+	static const int order[4] = { 1, 3, 2, 4 };
+
+	if (nkeys >= 3 && keyset[1].held && keyset[2].held) {
+		if (++held_ticks == 700 / POLL_MS) {
+			unsigned at = 0;
+
+			for (unsigned i = 0; i < 4; i++) {
+				if (order[i] == orientation_now) { at = i; }
+			}
+			orientation_now = order[(at + 1) % 4];
+			say("exynos_keys: both volume keys held: orientation %d\n", orientation_now);
+		}
+	} else {
+		held_ticks = 0;
+	}
+}
+
 static void
 keys_poll(void)
 {
@@ -142,6 +176,7 @@ keys_poll(void)
 			say("exynos_keys: %s %s\n", k->name, now ? "down" : "up");
 		}
 	}
+	keys_chord();
 }
 
 static void

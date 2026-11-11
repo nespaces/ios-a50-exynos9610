@@ -717,28 +717,29 @@ hip_scan_result(const uint8_t *sig, const uint8_t *data, unsigned len)
 
 /* Single diagnostic worker owns these buffers. Validate the entire chain before
  * publishing any returned ref: malformed/cyclic chains keep their ownership. */
-static uint8_t hip_rx_data[8192];
+static uint8_t hip_rx_data[32768];          /* a chain of up to 16 buffers of 2028 bytes; 8192 made a long chain "invalid" and its buffers were never returned */
+static unsigned hip_rx_why, hip_rx_a, hip_rx_b, hip_rx_c;
 static bool
 hip_rx_collect(vm_offset_t mem, uint32_t ref, uint32_t refs[16], unsigned *count,
     const uint8_t **signal, unsigned *signal_len, unsigned *data_len)
 {
 	uint32_t lo = hip_ref + HIP_RX_OFFSET, hi = lo + HIP_RX_SIZE;
 	*count = 0; *data_len = 0;
-	if (ref == 0) { return false; }
+	if (ref == 0) { hip_rx_why = 1; return false; }
 	while (ref) {
-		if (*count == 16 || ref < lo || ref > hi - 20 || (ref & 3)) { return false; }
-		for (unsigned i = 0; i < *count; i++) { if (refs[i] == ref) { return false; } }
+		if (*count == 16 || ref < lo || ref > hi - 20 || (ref & 3)) { hip_rx_why = 2; hip_rx_a = *count; hip_rx_b = ref; hip_rx_c = hi; return false; }
+		for (unsigned i = 0; i < *count; i++) { if (refs[i] == ref) { hip_rx_why = 3; hip_rx_a = *count; return false; } }
 		const uint8_t *m = (const uint8_t *)(mem + ref);
 		uint16_t sig = hip_u16(m + 10), len = hip_u16(m + 12), head = hip_u16(m + 14);
-		if (sig > hi - ref - 20) { return false; }
+		if (sig > hi - ref - 20) { hip_rx_why = 4; hip_rx_a = sig; hip_rx_b = ref; return false; }
 		if (*count == 0) {
-			if (!(m[4] & 1) || sig < 14) { return false; }
+			if (!(m[4] & 1) || sig < 14) { hip_rx_why = 5; hip_rx_a = m[4]; hip_rx_b = sig; return false; }
 			*signal = m + 24; *signal_len = sig - 4;
 		}
 		/* Signal-only RX has head rounded beyond sig_bufsz, dat_bufsz == 0.
 		 * Check payload ranges only when a payload actually exists. */
 		if (len) {
-			if (head < sig || (uint32_t)head + len > hi - ref - 20 || len > sizeof(hip_rx_data) - *data_len) { return false; }
+			if (head < sig || (uint32_t)head + len > hi - ref - 20 || len > sizeof(hip_rx_data) - *data_len) { hip_rx_why = 6; hip_rx_a = head << 16 | len; hip_rx_b = sig; hip_rx_c = *data_len; return false; }
 			memcpy(hip_rx_data + *data_len, m + 20 + head, len); *data_len += len;
 		}
 		refs[(*count)++] = ref;
@@ -1061,7 +1062,7 @@ hip_drain(vm_offset_t mem, vm_offset_t mbox, struct hip_control *h)
 
 				if (!hip_rx_collect(mem, ref, refs, &count, &s, &siglen, &len)) {
 					if (hip_bad_log++ < 8) {
-						say("scsc: HIP4 invalid RX chain +%#x q%u (kept, not returned)\n", ref, q);
+						say("scsc: HIP4 invalid RX chain +%#x q%u (kept, not returned): why %u a %#x b %#x c %#x\n", ref, q, hip_rx_why, hip_rx_a, hip_rx_b, hip_rx_c);
 					}
 					hip_index_set(h, q, 1, (uint8_t)(r + 1));
 					continue;
@@ -2654,29 +2655,66 @@ scsc_channels(struct hakios_sta_channel *channels, unsigned most)
 	return n;
 }
 
+/*
+ * Frames from the stack wait here for the HIP thread, which sends them one after the other. Before, a frame was handed to the
+ * thread by a one-job rendezvous: a second sender found it busy and its frame was dropped (3500 of 17000 in a run), and each
+ * handover waited for the thread's 10 ms nap.
+ */
+#define HIP_TXQ 128
+static struct { uint16_t length; uint8_t bytes[HAKIOS_NET_FRAME_MAX]; } hip_txq[HIP_TXQ];
+static unsigned hip_txq_head, hip_txq_tail;           /* both under hip_lock */
+
 static bool
 scsc_transmit(mbuf_t packet, size_t length)
 {
-	int err;
+	bool queued = false;
 
-	if (!hip_joined_v || packet == NULL || length < 14 || length > HAKIOS_NET_FRAME_MAX || hip_tx_busy) {
+	if (!hip_joined_v || packet == NULL || length < 14 || length > HAKIOS_NET_FRAME_MAX) {
 		return false;
 	}
-	hip_tx_busy = 1;
-	if (mbuf_copydata(packet, 0, (size_t)length, hip_tx_frame) != 0) {
-		hip_tx_busy = 0;
-		return false;
-	}
-	hip_tx_len = (unsigned)length;
-	err = hip_call(HIP_REQ_TX);
-	if (err != 0) {
-		if (hip_tx_said < 8) {
-			say("scsc: data TX %u bytes type %02x%02x not taken (%d)\n", (unsigned)length, hip_tx_frame[12],
-			    hip_tx_frame[13], err);
+	lck_mtx_lock(&hip_lock);
+	if (hip_alive && hip_txq_tail - hip_txq_head < HIP_TXQ) {
+		unsigned at = hip_txq_tail % HIP_TXQ;
+
+		if (mbuf_copydata(packet, 0, length, hip_txq[at].bytes) == 0) {
+			hip_txq[at].length = (uint16_t)length;
+			hip_txq_tail++;
+			queued = true;
 		}
+	}
+	lck_mtx_unlock(&hip_lock);
+	if (!queued && hip_tx_said < 8) {
+		say("scsc: data TX %u bytes not queued\n", (unsigned)length);
 		hip_tx_said++;
-		hip_tx_busy = 0;
-		return false;
+	}
+	return queued;
+}
+
+/* The HIP thread: send what is queued; false when the head had to wait (no free slot). */
+static bool
+hip_txq_run(vm_offset_t mem, vm_offset_t mbox, struct hip_control *h, unsigned * sent_n)
+{
+	for (unsigned budget = 0; budget < 32; budget++) {
+		int err;
+
+		lck_mtx_lock(&hip_lock);
+		if (hip_txq_head == hip_txq_tail) {
+			lck_mtx_unlock(&hip_lock);
+			return true;
+		}
+		unsigned at = hip_txq_head % HIP_TXQ;
+
+		hip_tx_len = hip_txq[at].length;
+		memcpy(hip_tx_frame, hip_txq[at].bytes, hip_tx_len);
+		lck_mtx_unlock(&hip_lock);
+		err = hip_tx_cmd(mem, mbox, h);
+		if (err == EAGAIN) {
+			return false;
+		}
+		lck_mtx_lock(&hip_lock);
+		hip_txq_head++;
+		lck_mtx_unlock(&hip_lock);
+		(*sent_n)++;
 	}
 	return true;
 }
@@ -2865,7 +2903,10 @@ hip_station(vm_offset_t mem, vm_offset_t mbox, uint32_t panic_off)
 		} else if (req == HIP_REQ_LEAVE) {
 			hip_finish(hip_leave_cmd(mem, mbox, h));
 		} else {
-			delay(10000);
+			unsigned sent_n = 0;
+			bool all_sent = hip_alive ? hip_txq_run(mem, mbox, h, &sent_n) : true;
+
+			delay(sent_n != 0 || !all_sent ? 200 : 2000);
 		}
 	}
 }
