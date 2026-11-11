@@ -3120,7 +3120,7 @@ static bool bt_host_flow;
 static uint8_t bt_reply[8], bt_reporting;
 static unsigned bt_reply_len;
 static bool bt_reply_pending;
-static unsigned bt_used, bt_tx_said, bt_rx_said, bt_backpressure_said;
+static unsigned bt_used, bt_tx_said, bt_rx_said, bt_backpressure_said, bt_acl_tx_said, bt_acl_rx_said;
 static uint16_t bt_vs_opcode;              /* the vendor command whose completion is forged */
 static uint8_t bt_vs_first;                 /* its first parameter: the subopcode iOS matches */
 
@@ -3298,6 +3298,11 @@ bt_acl_receive(unsigned *offset)
 	hip_put16(h4 + 1, handle | (pb << 12) | ((td[4] & 3) << 14));
 	hip_put16(h4 + 3, chunk);
 	memcpy(h4 + 5, td + 8 + *offset, chunk);
+	if (bt_acl_rx_said++ < 400 && *offset == 0 && chunk >= 8) {
+		say("scsc-bt: ACL RX handle %#x pb %u len %u l2cap len %u cid %#x:", handle, pb, chunk, hip_u16(h4 + 5), hip_u16(h4 + 7));
+		for (unsigned k = 9; k < chunk + 5 && k < 21; k++) { say(" %02x", h4[k]); }
+		say("\n");
+	}
 	if (ctl_enqueuedata(bt_ctl, unit, h4, chunk + 5, 0) != 0) {
 		lck_mtx_lock(&scsc_bt_lock);
 		if (flow && session == bt_session) { bt_host_used--; bt_links[handle].rx_credits--; }
@@ -3357,7 +3362,16 @@ scsc_bt_send(__unused kern_ctl_ref ref, uint32_t unit, __unused void *info, mbuf
 		if (type == 2 && bt_used >= 5) {
 			unsigned bytes = hip_u16(bt_fragment + 3);
 			if (bytes > BT_ACL_BYTES) { error = EMSGSIZE; break; }
-			if (bt_used == 5 + bytes) { error = bt_acl_send(bt_fragment, bt_used); bt_used = 0; }
+			if (bt_used == 5 + bytes) {
+				if (bt_acl_tx_said++ < 400 && bt_used >= 9) {
+					say("scsc-bt: ACL TX handle %#x flags %#x len %u l2cap len %u cid %#x:", hip_u16(bt_fragment + 1) & 0xfff,
+					    bt_fragment[2] & 0xf0, bytes, hip_u16(bt_fragment + 5), hip_u16(bt_fragment + 7));
+					for (unsigned k = 9; k < bt_used && k < 21; k++) { say(" %02x", bt_fragment[k]); }
+					say("\n");
+				}
+				error = bt_acl_send(bt_fragment, bt_used);
+				bt_used = 0;
+			}
 		} else if (type == 1 && bt_used >= 4 && bt_used == 4u + bt_fragment[3]) {
 			uint16_t opcode = hip_u16(bt_fragment + 1);
 			if (opcode == 0xfce2 || opcode == 0xfd1b) {
@@ -3382,7 +3396,7 @@ scsc_bt_send(__unused kern_ctl_ref ref, uint32_t unit, __unused void *info, mbuf
 			} else if (!bt_hci_send(bt_protocol, bt_mbox, bt_fragment + 1, bt_used - 1)) {
 				error = ENOBUFS;
 			}
-			if (bt_tx_said++ < 140) {
+			if (bt_tx_said++ < 700 && opcode != 0x200b && opcode != 0x200c) {
 				say("scsc-bt: iOS TX unit %u HCI %#x len %u errno %d\n", unit, opcode, bt_used - 1, error);
 			}
 			if (opcode == 0x200b || opcode == 0x200c) {
@@ -3521,7 +3535,7 @@ scsc_bt_events(__unused void *arg, __unused wait_result_t result)
 					if (bt_backpressure_said++ < 8) { say("scsc-bt: iOS H4 enqueue error %d unit %u\n", err, unit); }
 					break;
 				}
-				if (bt_rx_said++ < 140) {
+				if (bt_rx_said++ < 700) {
 					unsigned opcode = n >= 6 && h4[1] == 0x0e ? hip_u16(h4 + 4) : n == 6 && h4[1] == 0x0f ? hip_u16(h4 + 5) : 0;
 					unsigned status = h4[1] == 0x0e && n >= 6 ? h4[6] : h4[1] == 0x0f && n == 6 ? h4[3] : 0;
 					say("scsc-bt: iOS RX unit %u event %#x HCI %#x status %#x\n", unit, h4[1], opcode, status);

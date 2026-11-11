@@ -70,3 +70,8 @@ driver EXYNOS_POWEROFF
 	file    bsd/dev/hakios.exynos_poweroff.c
 	help    the Galaxy S9 powered off: PS_HOLD let go in the Exynos 9810's PMU, for the TMU's tmu_off=1 and for a halt
 	help    (halt_off=1: the panel blanked first, DCS display-off and sleep-in through DSIM0; halt_off=2: the APM stopped too)
+
+driver A50_TMU
+	file    bsd/dev/hakios.a50_tmu.c
+	help    the Galaxy A50's temperatures: the Exynos 9610's TMU read by the kernel (tmu9610=N: 1 log, 2 + kern.hakios.temp.*,
+	help    3 + the run handed back to the loader at tmu_stop degrees)

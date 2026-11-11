@@ -11,6 +11,7 @@
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
 #include <sys/hakios.exynos_hsi2c.h>
+#include <sys/hakios.physmap.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -399,6 +400,228 @@ csis_report(const char *when)
 	    rd(csis_base, 0x100), rd(csis_base, 0x104), rd(csis_base, 0x14), rd(csis_base, 0x1c), rd(csis_base, 0x700), rd(csis_base, 0x4));
 }
 
+/*
+ * campwr=8: CSIS0's test pattern into memory, as the Galaxy S9 port's cam_s9=4 does for CSIS1 (devices/starlte/CAMERA.md,
+ * hakios.exynos_camera.c: the same CSIS v5.1 registers at the same offsets). The A50's blocks, from its device tree:
+ * CSIS0 0x14400000, VC0's WDMA 0x14450000 with its DMA common at +0x400, the four CSISs' DMA common (arbitration, SRAM
+ * split, test pattern generator) 0x14490000, the CAM SysMMU 0x14550000 (must be off: the WDMA writes physical addresses).
+ * The buffer: 4 MB at 0xD8000000, outside XNU's RAM, below 4 GB (the S9's place; the display's scan-out buffers end below it,
+ * UFS's own memory starts at 0xDA000000). No sensor, no D-PHY lanes: the generator feeds the DMA.
+ */
+#define PAT_W                   1440
+#define PAT_H                   1080
+#define PAT_PA                  0xD8000000ULL
+#define PAT_BYTES               (4u << 20)
+#define WDMA_PA                 0x14450000UL
+#define CDMA_PA                 0x14490000UL
+#define SYSMMU_PA               0x14550000UL
+#define V_DMA_CTRL              0x000
+#define V_DMA_FMT               0x004
+#define V_DMA_ADDR(n)           (0x010 + 4 * (n))
+#define V_DMA_ACT_CTRL          0x030
+#define V_DMA_RESOL             0x040
+#define VCMN                    0x400
+#define VCMN_DATA_CTRL          0x00
+#define VCMN_INT_MASK           0x04
+#define VCMN_INT_SRC            0x08
+#define VCMN_CMN_CTRL           0x14
+#define VCMN_OTF_FORMAT         0x1C
+#define VCMN_IRQ_MASK           0x00F11F00u
+#define FRM_START0              (1u << 4)
+#define FRM_END0                (1u << 8)
+#define CD_ARB_PRI              0x00
+#define CD_CTRL                 0x08
+#define CD_SRAM_SPLIT           0x0C
+#define CD_MATRIX               0x10
+#define CD_CLK_CTRL             0x14
+#define TP_ENABLE               0x20
+#define TP_CTRL                 0x24
+#define TP_RESOL                0x28
+#define TP_ON                   (1u << 31)
+#define TP_DUAL                 (1u << 30)
+#define TP_VBLANK               100000u
+
+static bool
+wait_for(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, uint32_t ms)
+{
+	for (uint32_t t = 0; t < ms; t++) {
+		if ((rd(base, off) & mask) == want) {
+			return true;
+		}
+		delay(1000);
+	}
+	return (rd(base, off) & mask) == want;
+}
+
+static vm_offset_t other_wdma[2];
+
+static void
+pattern_stage(void)
+{
+	vm_offset_t pmu = ml_io_map(0x11860000UL, 0x5000), wdma = ml_io_map(WDMA_PA, 0x1000), cdma = ml_io_map(CDMA_PA, 0x1000);
+	vm_offset_t mmu = ml_io_map(SYSMMU_PA, 0x1000), sysreg = ml_io_map(0x14510000UL, 0x1000), cmu = ml_io_map(0x14500000UL, 0x4000);
+	vm_offset_t buf;
+	uint32_t v, changed = 0, last = 0;
+	bool ended;
+
+	csis_base = ml_io_map(0x14400000UL, 0x1000);
+	if (pmu == 0 || wdma == 0 || cdma == 0 || mmu == 0 || sysreg == 0 || csis_base == 0 || cmu == 0) {
+		say("campwr: 8: a block could not be mapped\n");
+		return;
+	}
+	say("campwr: 8: CAM domain %#x; BUS_USER %#x; CSIS0 version %#x CMN_CTRL %#x; WDMA CTRL %#x ACT_CTRL %#x; DMA common CTRL %#x "
+	    "CLK_CTRL %#x; SysMMU MMU_CTRL %#x\n", rd(pmu, 0x4024), rd(cmu, 0x100), rd(csis_base, 0), rd(csis_base, 4), rd(wdma, V_DMA_CTRL),
+	    rd(wdma, V_DMA_ACT_CTRL), rd(cdma, CD_CTRL), rd(cdma, CD_CLK_CTRL), rd(mmu, 0));
+	{
+		/* CMU_CAM's gates and Q-channels, as the boot left them: each said before it is read (a read that never comes back
+		 * ends the log at its offset) */
+		static const unsigned offs[] = { 0x2014, 0x2018, 0x201c, 0x2020, 0x2024, 0x2028, 0x202c, 0x2030, 0x2034, 0x2038, 0x203c, 0x2040,
+		    0x2044, 0x300c, 0x3010, 0x3014, 0x3018, 0x301c, 0x3020, 0x3024, 0x3028, 0x302c, 0x3030, 0x3034, 0x3038, 0x303c,
+		    0x3038, 0x303c };
+
+		for (unsigned i = 0; i < sizeof(offs) / sizeof(offs[0]); i++) {
+			say("campwr: 8: CMU_CAM %#x: ", offs[i]);
+			say("%#x\n", rd(cmu, offs[i]));
+		}
+	}
+	if (rd(mmu, 0) & 1) {
+		say("campwr: 8: the SysMMU translates (MMU_CTRL %#x): the WDMA's addresses would need a table; no DMA\n", rd(mmu, 0));
+		return;
+	}
+	buf = hakios_physmap_wc(PAT_PA, PAT_BYTES);
+	if (buf == 0) {
+		say("campwr: 8: the buffer (%#llx, %u bytes) cannot be mapped\n", PAT_PA, PAT_BYTES);
+		return;
+	}
+	memset((void *)buf, 0xA5, PAT_BYTES);
+	for (vm_offset_t line = buf; line < buf + PAT_BYTES; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
+	}
+	__asm__ volatile ("dsb sy" : : : "memory");
+	/* the D-PHY as in csis_setup (isolation, reset) is not needed for the generator: the link is only reset and set up */
+	wr(csis_base, 0x4, rd(csis_base, 0x4) | (1u << 1));
+	if (!wait_for(csis_base, 0x4, 1u << 1, 0, 2)) {
+		say("campwr: 8: CSIS0's reset does not finish (CMN_CTRL %#x)\n", rd(csis_base, 0x4));
+		return;
+	}
+	wr(csis_base, 0x10, 0x011FFF1Fu);
+	wr(csis_base, 0x18, 0x0000FFF0u);
+	wr(csis_base, 0x14, rd(csis_base, 0x14));
+	wr(csis_base, 0x1c, rd(csis_base, 0x1c));
+	v = rd(csis_base, 0x4) & ~((3u << 8) | (3u << 10));
+	wr(csis_base, 0x4, v | (3u << 8));
+	wr(csis_base, 0x704, (rd(csis_base, 0x704) & ~(0xfu << 1)) | (0xfu << 1));
+	/* VC0: RAW10, 2880x2156 would be the mode; PAT_W x PAT_H here, two pixels a clock; the other channels nothing */
+	wr(csis_base, 0x40, (rd(csis_base, 0x40) & ~0x33ffu) | (1u << 12) | (0x2bu << 2) | 0);
+	wr(csis_base, 0x44, ((uint32_t)PAT_H << 16) | PAT_W);
+	for (unsigned c = 1; c < 4; c++) {
+		wr(csis_base, 0x40 + 0x10 * c, (rd(csis_base, 0x40 + 0x10 * c) & ~0x33ffu) | (1u << 12) | (0x3fu << 2) | c);
+		wr(csis_base, 0x44 + 0x10 * c, 0);
+	}
+	/* VC0's WDMA: 2D, RAW10 not packed, the width; its common: OTF in, RAW10 */
+	wr(wdma, V_DMA_FMT, rd(wdma, V_DMA_FMT) & ~0x3fu);
+	wr(wdma, V_DMA_RESOL, (rd(wdma, V_DMA_RESOL) & ~0x3fffu) | PAT_W);
+	wr(wdma, VCMN + VCMN_OTF_FORMAT, rd(wdma, VCMN + VCMN_OTF_FORMAT) & ~3u);
+	wr(wdma, VCMN + VCMN_DATA_CTRL, rd(wdma, VCMN + VCMN_DATA_CTRL) & ~1u);
+	wr(wdma, VCMN + VCMN_INT_MASK, VCMN_IRQ_MASK);
+	wr(wdma, VCMN + VCMN_INT_SRC, rd(wdma, VCMN + VCMN_INT_SRC));
+	/* the DMA common as csi_hw_s_dma_common_dynamic leaves it for CSIS0 alone on the 9610 */
+	wr(cdma, CD_ARB_PRI, (rd(cdma, CD_ARB_PRI) & ~0xfu) | (1u << 2) | 1u);
+	wr(cdma, CD_CTRL, rd(cdma, CD_CTRL) | (1u << 1));
+	wr(cdma, CD_SRAM_SPLIT, (rd(cdma, CD_SRAM_SPLIT) & ~0x03ff03ffu) | (0x280u << 16) | 0x280u);
+	wr(cdma, CD_MATRIX, rd(cdma, CD_MATRIX) & ~0x1fu);
+	say("campwr: 8: CSIS0 set up: CMN_CTRL %#x CH0 %#x %#x; WDMA FMT %#x RESOL %#x; DMA common ARB %#x CTRL %#x SPLIT %#x MATRIX %#x\n",
+	    rd(csis_base, 4), rd(csis_base, 0x40), rd(csis_base, 0x44), rd(wdma, V_DMA_FMT), rd(wdma, V_DMA_RESOL), rd(cdma, CD_ARB_PRI),
+	    rd(cdma, CD_CTRL), rd(cdma, CD_SRAM_SPLIT), rd(cdma, CD_MATRIX));
+	v = rd(wdma, VCMN + VCMN_CMN_CTRL);
+	if (v & 1) {
+		wr(wdma, VCMN + VCMN_CMN_CTRL, v & ~1u);
+	}
+	/* the buffer to all eight frame pointers, the DMA on, the generator on for ONE frame */
+	wr(wdma, V_DMA_CTRL, rd(wdma, V_DMA_CTRL) & ~(7u << 2));
+	for (uint32_t i = 0; i < 8; i++) {
+		wr(wdma, V_DMA_ADDR(i), (uint32_t)PAT_PA);
+	}
+	wr(wdma, V_DMA_CTRL, rd(wdma, V_DMA_CTRL) | (1u << 0) | (1u << 1));
+	{
+		/* the generator may feed another CSIS's DMA: CSIS1's and CSIS2's VC0 get the buffer too (their interrupt sources are looked at) */
+		static const unsigned long others[2] = { 0x14460000UL, 0x14470000UL };
+
+		for (unsigned o = 0; o < 2; o++) {
+			vm_offset_t w = ml_io_map(others[o], 0x1000);
+
+			if (w == 0) { continue; }
+			wr(w, V_DMA_FMT, rd(w, V_DMA_FMT) & ~0x3fu);
+			wr(w, V_DMA_RESOL, (rd(w, V_DMA_RESOL) & ~0x3fffu) | PAT_W);
+			wr(w, VCMN + VCMN_OTF_FORMAT, rd(w, VCMN + VCMN_OTF_FORMAT) & ~3u);
+			wr(w, VCMN + VCMN_DATA_CTRL, rd(w, VCMN + VCMN_DATA_CTRL) & ~1u);
+			wr(w, VCMN + VCMN_INT_MASK, VCMN_IRQ_MASK);
+			wr(w, VCMN + VCMN_INT_SRC, rd(w, VCMN + VCMN_INT_SRC));
+			wr(w, V_DMA_CTRL, rd(w, V_DMA_CTRL) & ~(7u << 2));
+			for (uint32_t i = 0; i < 8; i++) { wr(w, V_DMA_ADDR(i), (uint32_t)PAT_PA); }
+			wr(w, V_DMA_CTRL, rd(w, V_DMA_CTRL) | (1u << 0) | (1u << 1));
+			other_wdma[o] = w;
+		}
+	}
+	wr(cdma, TP_CTRL, (rd(cdma, TP_CTRL) & ~0xffffffu) | (16u << 16) | (8u << 8) | 2u);
+	wr(cdma, TP_RESOL, ((uint32_t)PAT_H << 16) | PAT_W);
+	wr(cdma, TP_ENABLE, TP_DUAL | TP_VBLANK);
+	wr(cdma, TP_ENABLE, rd(cdma, TP_ENABLE) | TP_ON);
+	ended = wait_for(wdma, VCMN + VCMN_INT_SRC, FRM_END0, FRM_END0, 500);
+	if (!ended && !(rd(wdma, VCMN + VCMN_INT_SRC) & FRM_START0)) {
+		say("campwr: 8: no frame start with the link off: the pattern off, the link enabled (UPDATE_SHADOW, PHY_SEL 0, CSI_EN), on again\n");
+		wr(cdma, TP_ENABLE, rd(cdma, TP_ENABLE) & ~TP_ON);
+		delay(5000);
+		wr(csis_base, 0x4, rd(csis_base, 0x4) | (0xfu << 16));
+		wr(csis_base, 0x4, rd(csis_base, 0x4) & ~((1u << 21) | (1u << 20)));
+		wr(csis_base, 0x4, rd(csis_base, 0x4) | 1u);
+		wr(wdma, VCMN + VCMN_INT_SRC, rd(wdma, VCMN + VCMN_INT_SRC));
+		wr(cdma, TP_ENABLE, rd(cdma, TP_ENABLE) | TP_ON);
+		ended = wait_for(wdma, VCMN + VCMN_INT_SRC, FRM_END0, FRM_END0, 1500);
+	} else if (!ended) {
+		ended = wait_for(wdma, VCMN + VCMN_INT_SRC, FRM_END0, FRM_END0, 1500);
+	}
+	for (unsigned o = 0; o < 2; o++) {
+		if (other_wdma[o] != 0) {
+			say("campwr: 8: CSIS%u's WDMA INT_SRC %#x ACT_CTRL %#x\n", o + 1, rd(other_wdma[o], VCMN + VCMN_INT_SRC), rd(other_wdma[o], V_DMA_ACT_CTRL));
+			wr(other_wdma[o], V_DMA_CTRL, rd(other_wdma[o], V_DMA_CTRL) & ~((1u << 0) | (1u << 1)));
+		}
+	}
+	say("campwr: 8: %s: WDMA INT_SRC %#x ACT_CTRL %#x CTRL %#x; CSIS0 INT_SRC0 %#x INT_SRC1 %#x frames %u\n", ended ? "THE FRAME ENDED" : "no frame end",
+	    rd(wdma, VCMN + VCMN_INT_SRC), rd(wdma, V_DMA_ACT_CTRL), rd(wdma, V_DMA_CTRL), rd(csis_base, 0x14), rd(csis_base, 0x1c), rd(csis_base, 0x100));
+	wr(wdma, V_DMA_CTRL, rd(wdma, V_DMA_CTRL) & ~((1u << 0) | (1u << 1)));
+	wr(cdma, TP_ENABLE, rd(cdma, TP_ENABLE) & ~TP_ON);
+	delay(50000);
+	for (vm_offset_t line = buf; line < buf + PAT_BYTES; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
+	}
+	__asm__ volatile ("dsb sy" : : : "memory");
+	for (uint32_t i = 0; i < PAT_BYTES; i += 8) {
+		uint64_t w = *(const volatile uint64_t *)(buf + i);
+
+		if (w == 0xA5A5A5A5A5A5A5A5ULL) {
+			continue;
+		}
+		for (uint32_t k = 0; k < 8; k++) {
+			if (((w >> (8 * k)) & 0xff) != 0xA5) {
+				changed++;
+				last = i + k + 1;
+			}
+		}
+	}
+	say("campwr: 8: the buffer: %u bytes changed, the last at %u (%u a line over %u lines)\n", changed, last, last / PAT_H, PAT_H);
+	{
+		const uint8_t *b = (const uint8_t *)buf;
+
+		say("campwr: 8: first bytes: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x; at %u: %02x %02x %02x %02x\n",
+		    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15], PAT_W * 2,
+		    b[PAT_W * 2], b[PAT_W * 2 + 1], b[PAT_W * 2 + 2], b[PAT_W * 2 + 3]);
+	}
+	if (last != 0) {
+		say("campwr: 8: THE PATTERN REACHED MEMORY\n");
+	}
+}
+
 static void
 sensor_stage(uint32_t steps)
 {
@@ -583,7 +806,9 @@ campwr_thread(__unused void *arg, __unused wait_result_t wr_)
 	}
 	say("campwr: S2MPB03 PMIC_ID %#04x\n", id);
 	dump("as found");
-	if (steps == 6) {
+	if (steps == 8) {
+		pattern_stage();
+	} else if (steps == 6) {
 		cam_block_stage();
 	} else if (steps >= 3) {
 		sensor_stage(steps);

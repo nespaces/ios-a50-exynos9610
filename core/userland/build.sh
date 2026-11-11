@@ -837,6 +837,23 @@ for f in extensions.plist extensions.plist.sig; do
 	[ -f $DARWIN/rootfs/System/Library/xpc/$f ] && cp $DARWIN/rootfs/System/Library/xpc/$f root/xpc/
 done
 [ -d root/lib/HakiosAudio.driver ] && ln -s /redwood/lib/HakiosAudio.driver root/hal/HakiosAudio.driver
+# Apple's Bluetooth audio device for the audio server (the IPSW's System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver, which
+# select-system.py leaves out with the rest of System/Library/Audio; the HAL directory here is this image's /hal): bluetoothd
+# opens the A2DP stream, this is where mediaserverd's sound goes to bluetoothd. Yours, from your own IPSW, never in the repository.
+if [ -d ../apple-hal/BTAudioHALPlugin.driver ]; then
+	mkdir -p root/lib/BTAudioHALPlugin.driver
+	cp ../apple-hal/BTAudioHALPlugin.driver/BTAudioHALPlugin ../apple-hal/BTAudioHALPlugin.driver/Info.plist root/lib/BTAudioHALPlugin.driver/
+	[ -f ../apple-hal/BTAudioHALPlugin.driver/SpatialAudio.loctable ] && cp ../apple-hal/BTAudioHALPlugin.driver/SpatialAudio.loctable root/lib/BTAudioHALPlugin.driver/
+	ln -s /redwood/lib/BTAudioHALPlugin.driver root/hal/BTAudioHALPlugin.driver
+fi
+# ... and the audio clocks beside it, the other plug-ins the Bluetooth device works with (the IPSW's, from your own, as above)
+for d in AppleTimeSyncAudioClock NetworkUplinkClock; do
+	if [ -d ../apple-hal/$d.driver ]; then
+		mkdir -p root/lib/$d.driver
+		cp ../apple-hal/$d.driver/$d ../apple-hal/$d.driver/Info.plist root/lib/$d.driver/
+		ln -s /redwood/lib/$d.driver root/hal/$d.driver
+	fi
+done
 # the image: zlib where it saves room (a small file whole in its attribute, as Apple keeps them); fw/
 # as it is, which the kernel's drivers use where it lies in memory (drivers/storage/hakios.image.c)
 python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -1
